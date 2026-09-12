@@ -1,0 +1,16 @@
+{
+  "name": "index-messenger",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI gateway MVP: one message in, every platform out, in its own language",
+  "type": "module",
+  "workspaces": [
+    "core",
+    "hub"
+  ],
+  "scripts": {
+    "test": "npm run test --workspaces",
+    "typecheck": "npm run typecheck --workspaces"
+  },
+  "license": "MIT"
+}

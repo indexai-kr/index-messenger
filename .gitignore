@@ -1,0 +1,16 @@
+node_modules/
+dist/
+build/
+.gradle/
+.env
+.env.*
+!.env.example
+data/
+*.log
+*.png
+hub*.png
+.hub-dist/
+local.properties
+*.iml
+.DS_Store
+Thumbs.db

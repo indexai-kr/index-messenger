@@ -1,0 +1,6 @@
+// Top-level build file. Versions are centralized here; no device or
+// account information belongs anywhere in this app's sources or defaults.
+plugins {
+    id("com.android.application") version "8.5.2" apply false
+    id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+}
