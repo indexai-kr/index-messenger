@@ -24,4 +24,9 @@ English first for code and commit messages; Korean is welcome in issues.
 - ② Personal messenger adapters (including the KakaoTalk listener) stay
   free and non-commercial community property forever: no sale, no paid
   installation agency.
+- ③ Patent-protected implementations (safe-latch, spacetime-coordinate
+  constructs and the like) are never admitted to this repository. Such a
+  pull request is rejected. Rationale: this repository structurally
+  excludes patent implementations so that the Apache-2.0 patent grant
+  stays bounded to contributions made inside it.
 - Run the secret scan before every push (see README checklist).
