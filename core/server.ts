@@ -559,7 +559,10 @@ export async function startServer(config: ServerConfig): Promise<void> {
   });
 
   server.listen(config.port, () => {
-    console.log(`index-messenger core listening on :${config.port}`);
+    // Operator-visible policy state: which corridors are open. Pairs only,
+    // no message data.
+    const corridors = relay.map((p) => `${p.from}->${p.to}`).join(",") || "none";
+    console.log(`index-messenger core listening on :${config.port} (relay: ${corridors})`);
   });
 }
 
