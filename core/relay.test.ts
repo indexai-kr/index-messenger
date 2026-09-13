@@ -172,6 +172,24 @@ describe("relay kakao <-> discord", () => {
     assert.equal(lines.find((e) => e.verdict === "confirmed" && e.messageId === "kakao:g-1->discord")?.channel, "discord");
   });
 
+  it("loop guard: a delivered native id coming back through ingress is dropped as echo", async () => {
+    await post(core!.base, "/ingress", { origin: "kakao", nativeId: "k-3", lang: "en", body: "ping" });
+    // The discord executor sent kakao:k-3->discord and Discord assigned it id d-777.
+    const ack = await post(core!.base, "/outbox/ack", { messageId: "kakao:k-3->discord", channel: "discord", ok: true, nativeId: "d-777" });
+    assert.equal(ack.verdict, "delivered");
+    // The inbound poller now reads that same message from the channel.
+    const back = await post(core!.base, "/ingress", { origin: "discord", nativeId: "d-777", lang: "ko", body: "[ko] ping" });
+    assert.equal(back.dropped, "echo");
+    const lines = await ledger(core!);
+    assert.equal(lines.find((e) => e.messageId === "discord:d-777" && e.direction === "in")?.verdict, "echo");
+    assert.equal(lines.filter((e) => String(e.messageId).startsWith("discord:d-777->")).length, 0, "no fan-out, no re-relay");
+    assert.equal(lines.find((e) => e.messageId === "kakao:k-3->discord" && e.verdict === "delivered")?.nativeId, "d-777");
+    // A failed ack must not poison the echo set.
+    await post(core!.base, "/outbox/ack", { messageId: "kakao:k-3->telegram", channel: "telegram", ok: false, error: "x", nativeId: "t-9" });
+    const fresh = await post(core!.base, "/ingress", { origin: "telegram", nativeId: "t-9", lang: "ja", body: "はい" });
+    assert.equal(fresh.dropped, undefined);
+  });
+
   it("telegram -> discord is not whitelisted and stays record-only", async () => {
     await post(core!.base, "/ingress", { origin: "telegram", nativeId: "t-2", lang: "ja", body: "こんにちは" });
     assert.ok(!(await outbox(core!.base, "discord")).includes("telegram:t-2->discord"));

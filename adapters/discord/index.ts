@@ -7,10 +7,13 @@ export interface DiscordConfig {
   channelId: string;
 }
 
+// Returns the id Discord assigned to the created message: the executor
+// reports it in /outbox/ack so the core drops it as an echo when the
+// same message is read back from the channel.
 export async function sendDiscord(
   config: DiscordConfig,
   text: string,
-): Promise<void> {
+): Promise<string | undefined> {
   const res = await fetch(
     `https://discord.com/api/v10/channels/${config.channelId}/messages`,
     {
@@ -23,6 +26,8 @@ export async function sendDiscord(
     },
   );
   if (!res.ok) throw new Error(`discord send http ${res.status}`);
+  const created = (await res.json()) as { id?: string };
+  return created.id;
 }
 
 export interface DiscordAuthor {
@@ -49,6 +54,9 @@ export interface IngressPayload {
 export function toIngress(event: DiscordEvent): IngressPayload | null {
   if (!event.content) return null;
   const author = event.author;
+  // Belt to the core's echo set (suspenders): bot-authored messages are
+  // our own sends or other automation, never a person to relay.
+  if (author?.bot === true) return null;
   return {
     origin: "discord",
     nativeId: event.id ?? String(Date.now()),

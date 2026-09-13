@@ -193,6 +193,12 @@ export async function startServer(config: ServerConfig): Promise<void> {
       if (entry.direction === "in" && entry.verdict === undefined) {
         seenIngress.add(entry.messageId);
       }
+      // Echo set: native ids of messages our executors actually created.
+      // When one comes back through ingress it is our own send, not a
+      // new message — dropped before translation, never re-relayed.
+      if (entry.direction === "out" && entry.verdict === "delivered" && entry.nativeId) {
+        router.markEmitted(`${entry.channel}:${entry.nativeId}`);
+      }
     }
   } catch {
     // Fresh ledger: nothing to rebuild.
@@ -263,7 +269,18 @@ export async function startServer(config: ServerConfig): Promise<void> {
         }
         seenIngress.add(msg.id);
         if (router.isEcho(msg)) {
-          send(res, 200, { dropped: "echo" });
+          // Loop guard: this native id was created by one of our own
+          // executors. Receipt only — no body, no fan-out, no relay.
+          await ledger.append({
+            ts: Date.now(),
+            direction: "in",
+            channel: msg.origin,
+            messageId: msg.id,
+            lang: "",
+            body: "",
+            verdict: "echo",
+          });
+          send(res, 200, { dropped: "echo", messageId: msg.id });
           return;
         }
         const routed = await router.route(msg);
@@ -475,6 +492,7 @@ export async function startServer(config: ServerConfig): Promise<void> {
           ok: boolean;
           error?: string;
           mode?: string;
+          nativeId?: string;
         };
         if (typeof event.messageId !== "string" || typeof event.channel !== "string") {
           send(res, 400, { error: "messageId and channel are required" });
@@ -485,6 +503,14 @@ export async function startServer(config: ServerConfig): Promise<void> {
         // sent" apart from "pretended to send".
         const verdict =
           event.mode === "dry-run" ? "dry-run" : event.ok ? "delivered" : "failed";
+        // Native id of the message the executor created on the platform.
+        // Delivered acks only: it feeds the echo set so the same message
+        // is dropped when the platform hands it back through ingress.
+        const nativeId =
+          verdict === "delivered" && typeof event.nativeId === "string" && event.nativeId !== ""
+            ? event.nativeId
+            : undefined;
+        if (nativeId !== undefined) router.markEmitted(`${event.channel}:${nativeId}`);
         await ledger.append({
           ts: Date.now(),
           direction: "out",
@@ -495,6 +521,7 @@ export async function startServer(config: ServerConfig): Promise<void> {
           // error code; dry runs carry nothing. No user content either way.
           body: event.ok && event.mode !== "dry-run" ? "" : (event.error ?? "failed"),
           verdict,
+          ...(nativeId !== undefined ? { nativeId } : {}),
         });
         send(res, 200, { acked: true, verdict });
         return;
