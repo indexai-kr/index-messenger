@@ -12,5 +12,5 @@
     "test": "npm run test --workspaces",
     "typecheck": "npm run typecheck --workspaces"
   },
-  "license": "MIT"
+  "license": "Apache-2.0"
 }

@@ -5,10 +5,10 @@
   "type": "module",
   "main": "./index.ts",
   "scripts": {
-    "test": "node --test ./router.test.ts ./gate.test.ts ./ledger.test.ts",
+    "test": "node --test ./router.test.ts ./gate.test.ts ./ledger.test.ts ./ack.test.ts ./ingress.test.ts",
     "typecheck": "npx -y tsc --noEmit"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "devDependencies": {
     "@types/node": "^22.7.4",
     "typescript": "^5.5.3"

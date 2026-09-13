@@ -153,12 +153,27 @@ Give us refutations over stars. Whoever finds the gaps in our gate is this proje
 
 ## Quickstart (P1)
 
+Prerequisites: Node ≥ 22.6 (TypeScript type-stripping), npm ≥ 7
+(workspaces). Verified on Node v24 + npm v11.
+
 ```sh
 cp .env.example .env   # fill in your own tokens
 npm install
 npm test --workspace @index-messenger/core
 PORT=8787 BINDINGS_PATH=./core/bindings.example.json LEDGER_PATH=./data/ledger.jsonl \
   node --experimental-strip-types ./core/server.ts
+npm run dev --workspace @index-messenger/hub
+```
+
+Windows PowerShell (the `VAR=…` prefix and `\` continuation do not work
+there — this is the equivalent):
+
+```powershell
+Copy-Item .env.example .env   # fill in your own tokens
+npm install
+npm test --workspace @index-messenger/core
+$env:PORT='8787'; $env:BINDINGS_PATH='./core/bindings.example.json'; $env:LEDGER_PATH='./data/ledger.jsonl'
+node --experimental-strip-types ./core/server.ts
 npm run dev --workspace @index-messenger/hub
 ```
 
