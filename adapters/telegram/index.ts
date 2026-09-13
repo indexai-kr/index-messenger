@@ -66,6 +66,7 @@ export function toIngress(update: TelegramUpdate): {
   nativeId: string;
   lang: string;
   body: string;
+  sender?: { platform: string; id: string; displayName: string };
 } | null {
   const inbound = update.message ?? update.channel_post;
   const text = inbound?.text;

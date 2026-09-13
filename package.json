@@ -9,8 +9,8 @@
     "hub"
   ],
   "scripts": {
-    "test": "npm run test --workspaces",
-    "typecheck": "npm run typecheck --workspaces"
+    "test": "npm run test --workspaces && node --test ./adapters/discord/runner.test.ts",
+    "typecheck": "npm run typecheck --workspaces && npx -y tsc -p adapters"
   },
   "license": "Apache-2.0"
 }
