@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, type LedgerEntry, type RoundTrip } from "./api";
+import { api, type LedgerEntry, type RoundTrip } from "./api.ts";
 
 // Single conversation screen (Korean hub) + channel binding settings.
 // Polls /ledger for the converged Korean view; posts via /send so the
@@ -11,6 +11,7 @@ export function App(): JSX.Element {
   const [held, setHeld] = useState<{ id: string; matched: string[]; roundTrips: RoundTrip[] } | null>(null);
   const [error, setError] = useState("");
   const [showRaw, setShowRaw] = useState(false);
+  const [loading, setLoading] = useState(true);
 
   async function refresh(): Promise<void> {
     try {
@@ -20,6 +21,8 @@ export function App(): JSX.Element {
       setError("");
     } catch (e) {
       setError((e as Error).message);
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -68,6 +71,7 @@ function formatLine(e: LedgerEntry): string {
   return (
     <main style={{ maxWidth: 720, margin: "0 auto", padding: 16 }}>
       <h1>Index Messenger Hub</h1>
+      {loading && <p>불러오는 중…</p>}
       {error !== "" && <p role="alert">연결 오류: {error}</p>}
       <section>
         <h2>대화 (한국어)</h2>

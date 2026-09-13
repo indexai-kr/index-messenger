@@ -1,12 +1,24 @@
 const BASE = "";
 
+// Cold-start tolerance (issues #2): the very first poll can hit a proxy
+// that is not ready yet. Exactly one retry, then the error stands —
+// no infinite loops, no silent swallowing.
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}/api${path}`, {
-    headers: { "content-type": "application/json" },
-    ...init,
-  });
-  if (!res.ok) throw new Error(`hub api ${res.status}`);
-  return (await res.json()) as T;
+  let lastError: unknown = new Error("hub api unreachable");
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(`${BASE}/api${path}`, {
+        headers: { "content-type": "application/json" },
+        ...init,
+      });
+      if (!res.ok) throw new Error(`hub api ${res.status}`);
+      return (await res.json()) as T;
+    } catch (error) {
+      lastError = error;
+      if (attempt === 0) await new Promise((r) => setTimeout(r, 800));
+    }
+  }
+  throw lastError;
 }
 
 export interface LedgerEntry {

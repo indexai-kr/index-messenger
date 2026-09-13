@@ -9,6 +9,7 @@ data/
 *.log
 *.png
 hub*.png
+!docs/media/*.gif
 .hub-dist/
 local.properties
 *.iml
