@@ -80,6 +80,8 @@ AI는 가능성을 만들었다. 그러나 생성의 힘을 파는 회사들은 
 
 (P1 실측 기록: 한 `내일 3시에 5만원 보내줘` → 일 `明日3時に5万円送ってください` → 역번역 `내일 3시에 5만 엔 보내주세요`. 원장의 gate 항목에 전건 보존.)
 
+*Measured case (EN): "5만원" (KRW 50,000) came back as "5万円" (JPY 50,000 — roughly 10× at then-current rates). The gate held it and the back-translation exposed it; auto-send would have delivered it as-is.*
+
 ## Manifesto (EN)
 
 ### Two rooms
