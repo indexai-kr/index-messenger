@@ -219,7 +219,11 @@ export async function startServer(config: ServerConfig): Promise<void> {
           sender?: unknown;
         };
         const sender = asSender(event.sender);
-        const msg = makeMessage(event.origin, event.nativeId, event.lang, event.body, Date.now(), sender);
+        // Language is a property of the channel's user, not of the client:
+        // bindings[origin] wins over the claimed lang (the kakao listener
+        // hardcodes ko; an English-speaking room still reads as English).
+        const lang = router.getBindings()[event.origin] ?? event.lang;
+        const msg = makeMessage(event.origin, event.nativeId, lang, event.body, Date.now(), sender);
         // Idempotency: nativeId is the key. A re-injected id executes
         // nothing — only the duplicate receipt is logged.
         if (seenIngress.has(msg.id)) {

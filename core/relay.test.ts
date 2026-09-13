@@ -131,6 +131,16 @@ describe("relay kakao <-> discord", () => {
     assert.equal(outLine(lines, "kakao:k-2->telegram")?.verdict, "record-only");
   });
 
+  it("ingress lang is normalized from the origin binding, not the client claim", async () => {
+    // The kakao listener hardcodes lang=ko; the bound room speaks English.
+    await post(core!.base, "/ingress", { origin: "kakao", nativeId: "k-lang", lang: "ko", body: "see you" });
+    const lines = await ledger(core!);
+    const inbound = lines.find((e) => e.direction === "in" && e.messageId === "kakao:k-lang");
+    assert.equal(inbound?.lang, "en");
+    // Same-language copy is passed through untouched (no en->en round trip).
+    assert.equal(outLine(lines, "kakao:k-lang->slack")?.body, "see you");
+  });
+
   it("discord -> kakao goes out tagged origin=relay", async () => {
     await post(core!.base, "/ingress", { origin: "discord", nativeId: "d-2", lang: "ko", body: "잘 지내니" });
     assert.ok((await outbox(core!.base, "kakao")).includes("discord:d-2->kakao"));
