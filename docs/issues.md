@@ -26,3 +26,9 @@
 - 해결 (P4): `hub/src/api.ts`의 모든 호출에 정확히 1회 재시도, `App.tsx`에
   로딩 표시 추가, 2회 연속 실패 시에만 오류 표시. 테스트
   `hub/src/api.test.ts` 2건(재시도 성공·무한 재시도 없음). 무한 재시도 없음.
+
+## #3 getParcelableArray deprecated (OPEN, helper scope, no code fix)
+
+- Location: apps/kakao-listener KakaoListener.kt message bundling (extras.getParcelableArray).
+- Status: deprecated API in use; typed overload exists on newer platforms. Left as-is per directive — replacement needs an SDK to verify against, and this environment has none.
+- Fix when an SDK-capable machine is available; keep behavior (multi-message burst injection) identical.

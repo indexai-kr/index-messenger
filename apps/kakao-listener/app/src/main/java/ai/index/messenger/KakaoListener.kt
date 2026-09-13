@@ -1,13 +1,11 @@
 package ai.index.messenger
 
-import android.app.Notification
-import android.app.RemoteInput
-import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import androidx.core.app.NotificationCompat
+import androidx.core.app.RemoteInput
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -131,27 +129,30 @@ sealed interface RoomResolution {
 object ReplySender {
     fun reply(listener: KakaoListener, sbn: StatusBarNotification, text: String): ReplyResult {
         return try {
-            val action = remoteInputAction(listener, sbn) ?: return ReplyResult(false, "no-remote-input")
+            val action = remoteInputAction(sbn) ?: return ReplyResult(false, "no-remote-input")
+            val remoteInputs = action.remoteInputs ?: return ReplyResult(false, "no-remote-input")
+            val pending = action.actionIntent ?: return ReplyResult(false, "no-action-intent")
             val results = Bundle()
-            action.remoteInputs.forEach { remoteInput ->
+            remoteInputs.forEach { remoteInput ->
                 results.putCharSequence(remoteInput.resultKey, text)
             }
-            val filled = Intent().also { RemoteInput.addResultsToIntent(action.remoteInputs, it, results) }
-            action.actionIntent.send(listener, 0, filled)
+            val filled = Intent().also { RemoteInput.addResultsToIntent(remoteInputs, it, results) }
+            pending.send(listener, 0, filled)
             ReplyResult(true)
         } catch (e: Exception) {
             ReplyResult(false, e.javaClass.simpleName)
         }
     }
 
-    private fun remoteInputAction(
-        context: Context,
-        sbn: StatusBarNotification,
-    ): NotificationCompat.Action? {
-        val framework: Array<Notification.Action> = sbn.notification.actions ?: emptyArray()
-        val wearable = NotificationCompat.WearableExtender(sbn.notification).actions
-        return (framework.mapNotNull { NotificationCompat.Action.Builder(it).build() } + wearable)
-            .firstOrNull { !it.remoteInputs.isNullOrEmpty() }
+    // Compat types end to end: framework actions are read through
+    // NotificationCompat.getAction so they share one RemoteInput type with
+    // the wearable extender actions.
+    private fun remoteInputAction(sbn: StatusBarNotification): NotificationCompat.Action? {
+        val notification = sbn.notification
+        val framework = (0 until NotificationCompat.getActionCount(notification))
+            .mapNotNull { NotificationCompat.getAction(notification, it) }
+        val wearable = NotificationCompat.WearableExtender(notification).actions
+        return (framework + wearable).firstOrNull { !it.remoteInputs.isNullOrEmpty() }
     }
 
     fun findNotification(listener: KakaoListener, room: String): Pair<StatusBarNotification, RoomResolution>? {
