@@ -34,6 +34,12 @@ class KakaoListener : NotificationListenerService() {
         if (sbn.packageName != KAKAO_PACKAGE) return
         val extras = sbn.notification.extras ?: return
         val room = roomOf(extras) ?: return
+        // One room only. The bridge is scoped to the room the owner named
+        // in settings; every other KakaoTalk notification on this phone is
+        // none of the hub's business — not read, not indexed, not sent
+        // anywhere. An empty setting means no room, hence no ingress.
+        val bound = config.defaultRoom
+        if (bound.isEmpty() || room != bound) return
         val items = messagesOf(extras)
         if (items.isEmpty()) return
         RoomIndex.put(room, sbn.key)

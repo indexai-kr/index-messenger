@@ -7,8 +7,13 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
+    <!-- The hub is reached over plain HTTP on the owner's own LAN (the core
+         API binds behind the operator's boundary, see docs/cowork-ops.md).
+         Android 9+ / targetSdk 34 blocks cleartext by default, which made
+         every HubClient call fail silently on the first device run. -->
     <application
         android:label="Index Kakao Bridge"
+        android:usesCleartextTraffic="true"
         android:theme="@style/Theme.AppCompat.Light.NoActionBar">
 
         <activity
