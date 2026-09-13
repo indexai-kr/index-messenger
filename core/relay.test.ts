@@ -149,6 +149,29 @@ describe("relay kakao <-> discord", () => {
     assert.equal(sent?.lang, "en");
   });
 
+  it("relay copies pass the L4 gate: risk patterns hold until /confirm", async () => {
+    const r = await post(core!.base, "/ingress", { origin: "kakao", nativeId: "g-1", lang: "en", body: "call me at 10:30" });
+    const policies = r.policies as Array<{ channel: string; policy: string; matched?: string[] }>;
+    const discord = policies.find((p) => p.channel === "discord");
+    assert.equal(discord?.policy, "held");
+    assert.ok(discord?.matched?.includes("time"));
+    assert.ok(!(await outbox(core!.base, "discord")).includes("kakao:g-1->discord"), "held copy is not sendable");
+    let lines = await ledger(core!);
+    const hold = lines.find((e) => e.direction === "gate" && e.messageId === "kakao:g-1->discord");
+    assert.equal(hold?.verdict, "hold");
+    assert.equal(hold?.origin, "relay");
+    assert.equal(outLine(lines, "kakao:g-1->discord"), undefined, "no out line before confirmation");
+    const c = await post(core!.base, "/confirm", { id: "kakao:g-1->discord" });
+    assert.equal(c.confirmed, true);
+    assert.equal(c.released, "discord");
+    assert.ok((await outbox(core!.base, "discord")).includes("kakao:g-1->discord"));
+    lines = await ledger(core!);
+    const released = outLine(lines, "kakao:g-1->discord");
+    assert.equal(released?.origin, "relay");
+    assert.equal(released?.verdict, undefined);
+    assert.equal(lines.find((e) => e.verdict === "confirmed" && e.messageId === "kakao:g-1->discord")?.channel, "discord");
+  });
+
   it("telegram -> discord is not whitelisted and stays record-only", async () => {
     await post(core!.base, "/ingress", { origin: "telegram", nativeId: "t-2", lang: "ja", body: "こんにちは" });
     assert.ok(!(await outbox(core!.base, "discord")).includes("telegram:t-2->discord"));

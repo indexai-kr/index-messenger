@@ -116,7 +116,13 @@ export async function startServer(config: ServerConfig): Promise<void> {
 
   const router = new Router({ bindings, translate });
   const relay = await loadRelay(config.relayPath);
-  const pending = new Map<string, { to: string; body: string; lang: string }>();
+  // Held sends awaiting /confirm. `to: "fanout"` is a hub draft (the hub
+  // fans out after confirmation); any other `to` is one relay copy that
+  // is released as a sendable out line on confirmation.
+  const pending = new Map<
+    string,
+    { to: string; body: string; lang: string; sender?: SenderInfo; origin?: string }
+  >();
 
   // Fan-out recorder shared by every ingress path. Policy per copy:
   //   send        hub/cowork-originated, or a hub display copy -> sendable
@@ -126,15 +132,39 @@ export async function startServer(config: ServerConfig): Promise<void> {
   //   record-only every other derived copy: written to the ledger for the
   //               converged view, carries a verdict so /outbox never serves
   //               it. This is the "hub-originated sends only" rule in code.
+  // A relay copy is not exempt from the L4 gate: risk patterns in the
+  // source or the translated text hold it (gate|hold + pending) until
+  // POST /confirm releases it. Hub sends pass the same gate via /send.
   async function recordFanout(
-    msg: { id: string; origin: string },
+    msg: { id: string; origin: string; body: string },
     sender: SenderInfo | undefined,
     targets: Array<{ channel: string; lang: string; body: string }>,
-  ): Promise<Array<{ channel: string; policy: OutPolicy }>> {
-    const decisions: Array<{ channel: string; policy: OutPolicy }> = [];
+  ): Promise<Array<{ channel: string; policy: OutPolicy | "held"; matched?: string[] }>> {
+    const decisions: Array<{ channel: string; policy: OutPolicy | "held"; matched?: string[] }> = [];
     for (const copy of targets) {
       const policy = outPolicy(msg.origin, copy.channel, relay);
       const outId = `${msg.id}->${copy.channel}`;
+      if (policy === "relay") {
+        const matched = [...new Set([...inspect(msg.body), ...inspect(copy.body)])];
+        if (matched.length > 0) {
+          await ledger.append({
+            ts: Date.now(),
+            direction: "gate",
+            channel: copy.channel,
+            messageId: outId,
+            lang: copy.lang,
+            body: copy.body,
+            translatedLang: copy.lang,
+            translatedBody: copy.body,
+            sender,
+            origin: "relay",
+            verdict: "hold",
+          });
+          pending.set(outId, { to: copy.channel, body: copy.body, lang: copy.lang, sender, origin: "relay" });
+          decisions.push({ channel: copy.channel, policy: "held", matched });
+          continue;
+        }
+      }
       await ledger.append({
         ts: Date.now(),
         direction: "out",
@@ -389,16 +419,36 @@ export async function startServer(config: ServerConfig): Promise<void> {
           return;
         }
         pending.delete(event.id);
+        const body = event.body ?? held.body;
+        const isRelay = held.to !== "fanout";
         await ledger.append({
           ts: Date.now(),
           direction: "gate",
-          channel: "hub",
+          channel: isRelay ? held.to : "hub",
           messageId: event.id,
           lang: held.lang,
-          body: event.body ?? held.body,
+          body,
+          origin: held.origin,
           verdict: "confirmed",
         });
-        send(res, 200, { confirmed: true });
+        // A confirmed relay copy becomes the sendable out line it would
+        // have been without the hold — same shape, same /outbox path.
+        if (isRelay) {
+          await ledger.append({
+            ts: Date.now(),
+            direction: "out",
+            channel: held.to,
+            messageId: event.id,
+            lang: held.lang,
+            body,
+            translatedLang: held.lang,
+            translatedBody: body,
+            sender: held.sender,
+            origin: held.origin,
+          });
+          router.markEmitted(event.id);
+        }
+        send(res, 200, { confirmed: true, released: isRelay ? held.to : undefined });
         return;
       }
       // Outbox queue for poll-based executors (kakao-listener, discord runner).
