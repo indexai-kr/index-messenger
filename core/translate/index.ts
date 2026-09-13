@@ -3,7 +3,7 @@
 // SDK, so the provider stays replaceable.
 
 export interface TranslateProvider {
-  translate(text: string, from: string, to: string): Promise<string>;
+  translate(text: string, from: string, to: string, signal?: AbortSignal): Promise<string>;
 }
 
 export interface OpenAICompatibleOptions {
@@ -26,10 +26,10 @@ export class OpenAICompatibleProvider implements TranslateProvider {
     this.timeoutMs = options.timeoutMs ?? 15000;
   }
 
-  async translate(text: string, from: string, to: string): Promise<string> {
+  async translate(text: string, from: string, to: string, signal?: AbortSignal): Promise<string> {
     if (from === to) return text;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const timeout = AbortSignal.timeout(this.timeoutMs);
+    const combined = signal !== undefined ? AbortSignal.any([timeout, signal]) : timeout;
     try {
       const res = await fetch(`${this.baseUrl}/chat/completions`, {
         method: "POST",
@@ -48,7 +48,7 @@ export class OpenAICompatibleProvider implements TranslateProvider {
             { role: "user", content: text },
           ],
         }),
-        signal: controller.signal,
+        signal: combined,
       });
       if (!res.ok) throw new Error(`translate http ${res.status}`);
       const data = (await res.json()) as {
@@ -57,8 +57,9 @@ export class OpenAICompatibleProvider implements TranslateProvider {
       const out = data.choices?.[0]?.message?.content?.trim();
       if (!out) throw new Error("translate empty response");
       return out;
-    } finally {
-      clearTimeout(timer);
+    } catch (error) {
+      if (signal?.aborted) throw new Error("translate aborted");
+      throw error;
     }
   }
 }

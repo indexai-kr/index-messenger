@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { Router, type BindingTable } from "./router.ts";
 import { Ledger } from "./ledger.ts";
 import { inspect } from "./gate.ts";
+import { pLimit } from "./p-limit.ts";
 import {
   OpenAICompatibleProvider,
   PassthroughProvider,
@@ -242,7 +243,11 @@ export async function startServer(config: ServerConfig): Promise<void> {
         return;
       }
       if (req.method === "GET" && req.url === "/ledger") {
-        send(res, 200, await ledger.readAll());
+        const all = await ledger.readAll();
+        // Logical-order reads: write order scrambles under parallel
+        // fan-out, so integrity lives in sorted reads, not file order.
+        all.sort((a, b) => a.ts - b.ts || (a.messageId < b.messageId ? -1 : a.messageId > b.messageId ? 1 : 0));
+        send(res, 200, all);
         return;
       }
       // Ingress from any adapter: { origin, nativeId, lang, body, sender? }
@@ -367,25 +372,27 @@ export async function startServer(config: ServerConfig): Promise<void> {
           send(res, 200, { held: false, id, matched, roundTrips: [] });
           return;
         }
-        const roundTrips: Array<{
+        // Hybrid parallel legs: channels run concurrently under a cap,
+        // translate->back per channel stays serial. Abort fires on ERRORS
+        // only (transport/provider failure) — hold is a normal verdict
+        // decided upfront by inspect(), never a failure, so it can never
+        // cancel sibling channels. One channel's error aborts the rest
+        // (fail-fast) and the request 500s via the outer catch.
+        const gateConcurrency = Math.max(1, Number(env("GATE_CONCURRENCY", "4")) || 4);
+        const limit = pLimit(gateConcurrency);
+        const abort = new AbortController();
+        const leg = async (
+          channel: string,
+          lang: string,
+        ): Promise<{
           channel: string;
           lang: string;
           translated: string;
           backTranslation: string;
           translateMs: number;
           backMs: number;
-        }> = [];
-        for (const [channel, lang] of Object.entries(router.getBindings())) {
-          if (channel === "hub") continue;
+        }> => {
           if (lang === event.lang) {
-            roundTrips.push({
-              channel,
-              lang,
-              translated: event.body,
-              backTranslation: event.body,
-              translateMs: 0,
-              backMs: 0,
-            });
             await ledger.append({
               ts: Date.now(),
               direction: "gate",
@@ -397,21 +404,20 @@ export async function startServer(config: ServerConfig): Promise<void> {
               translatedBody: event.body,
               verdict: "hold",
             });
-            continue;
+            return {
+              channel,
+              lang,
+              translated: event.body,
+              backTranslation: event.body,
+              translateMs: 0,
+              backMs: 0,
+            };
           }
           const t0 = Date.now();
-          const translated = await translate.translate(event.body, event.lang, lang);
+          const translated = await translate.translate(event.body, event.lang, lang, abort.signal);
           const t1 = Date.now();
-          const backTranslation = await translate.translate(translated, lang, hubLang);
+          const backTranslation = await translate.translate(translated, lang, hubLang, abort.signal);
           const t2 = Date.now();
-          roundTrips.push({
-            channel,
-            lang,
-            translated,
-            backTranslation,
-            translateMs: t1 - t0,
-            backMs: t2 - t1,
-          });
           await ledger.append({
             ts: Date.now(),
             direction: "gate",
@@ -423,6 +429,25 @@ export async function startServer(config: ServerConfig): Promise<void> {
             translatedBody: backTranslation,
             verdict: "hold",
           });
+          return {
+            channel,
+            lang,
+            translated,
+            backTranslation,
+            translateMs: t1 - t0,
+            backMs: t2 - t1,
+          };
+        };
+        let roundTrips: Awaited<ReturnType<typeof leg>>[];
+        try {
+          roundTrips = await Promise.all(
+            Object.entries(router.getBindings())
+              .filter(([channel]) => channel !== "hub")
+              .map(([channel, lang]) => limit(() => leg(channel, lang))),
+          );
+        } catch (error) {
+          abort.abort();
+          throw error;
         }
         pending.set(id, { to: "fanout", body: event.body, lang: event.lang });
         send(res, 200, { held: true, id, matched, roundTrips });
