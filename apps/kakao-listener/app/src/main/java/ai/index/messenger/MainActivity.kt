@@ -32,6 +32,7 @@ class MainActivity : AppCompatActivity() {
         val quietEnd = findViewById<EditText>(R.id.quietEnd)
         val dailyCap = findViewById<EditText>(R.id.dailyCap)
         val dryRun = findViewById<CheckBox>(R.id.dryRun)
+        val allowBackfill = findViewById<CheckBox>(R.id.allowBackfill)
 
         baseUrl.setText(config.coreBaseUrl)
         pollSecs.setText(config.pollSecs.toString())
@@ -43,6 +44,7 @@ class MainActivity : AppCompatActivity() {
         quietEnd.setText(config.quietEnd.toString())
         dailyCap.setText(config.dailyCap.toString())
         dryRun.isChecked = config.dryRun
+        allowBackfill.isChecked = config.allowBackfill
         status.text = "listener-bound room count: (see system notification)"
 
         findViewById<Button>(R.id.save).setOnClickListener {
@@ -56,6 +58,7 @@ class MainActivity : AppCompatActivity() {
             config.quietEnd = quietEnd.text.toString().toIntOrNull() ?: 7
             config.dailyCap = dailyCap.text.toString().toIntOrNull() ?: 50
             config.dryRun = dryRun.isChecked
+            config.allowBackfill = allowBackfill.isChecked
             ContextCompat.startForegroundService(this, Intent(this, PollService::class.java))
             status.text = "saved — poll loop running"
         }

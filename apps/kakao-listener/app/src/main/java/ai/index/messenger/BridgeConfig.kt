@@ -91,11 +91,21 @@ class BridgeConfig(context: Context) {
     }
 
     var lastAckTs: Long
-        get() = prefs.getLong(KEY_SINCE, 0L)
+        get() = prefs.getLong(KEY_SINCE, -1L)
         set(v) = prefs.edit().putLong(KEY_SINCE, v).apply()
+
+    // Opt-in backlog catch-up. Default false: first boot starts at now.
+    var allowBackfill: Boolean
+        get() = prefs.getBoolean(KEY_BACKFILL, false)
+        set(v) = prefs.edit().putBoolean(KEY_BACKFILL, v).apply()
+
+    // Outbox-side dedupe uses the same delivered set as ingress
+    // (messageIds are globally unique), hence no second store.
 
     // Delivered ingress ids (dedupe). Bodies are never stored here.
     fun isDelivered(id: String): Boolean = delivered().contains(id)
+
+    fun snapshotDelivered(): Set<String> = delivered().toSet()
 
     fun markDelivered(id: String) {
         val keep = (delivered() + id).takeLast(MAX_DELIVERED)
@@ -111,6 +121,7 @@ class BridgeConfig(context: Context) {
         private const val KEY_MAX_RETRY = "max_retry"
         private const val KEY_ROOM = "default_room"
         private const val KEY_SINCE = "last_ack_ts"
+        private const val KEY_BACKFILL = "allow_backfill"
         private const val KEY_DELIVERED = "delivered_ids"
         private const val KEY_SAME_ROOM = "same_room_secs"
         private const val KEY_SWITCH_ROOM = "room_switch_secs"

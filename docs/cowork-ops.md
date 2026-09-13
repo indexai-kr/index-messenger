@@ -61,6 +61,10 @@ Skipping step 1 bypasses the gate and violates the policy below.
 A retried id executes nothing — only the duplicate receipt is logged
 (`verdict: duplicate`). Timeouts are safe to retry with the same id.
 
+Path note: the hub screen's `/send` leaves gate lines only — it never
+creates `out` entries. Anything that must actually send goes through
+`/cowork/ingress` (or an `origin=hub` ingress).
+
 ## Acknowledge: consumed is not delivered
 
 Two different acts, two different states. Mixing them corrupts delivery

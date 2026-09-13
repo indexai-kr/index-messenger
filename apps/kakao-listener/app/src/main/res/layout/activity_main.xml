@@ -73,6 +73,12 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content" />
 
+    <CheckBox
+        android:id="@+id/allowBackfill"
+        android:text="backfill: fetch pre-boot outbox on first poll"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content" />
+
     <Button
         android:id="@+id/save"
         android:text="Save and start"

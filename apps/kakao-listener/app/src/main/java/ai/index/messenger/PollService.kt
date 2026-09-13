@@ -63,11 +63,26 @@ class PollService : Service() {
     private suspend fun pollOnce() {
         val baseUrl = config.coreBaseUrl
         if (baseUrl.isEmpty()) return
+        // First boot starts at now: the backlog already sitting in the
+        // outbox (e.g. older fan-outs) is NOT auto-fired into the test
+        // room. Backfill is opt-in via settings. The ledger is untouched.
+        if (config.lastAckTs < 0 && !config.allowBackfill) {
+            config.lastAckTs = System.currentTimeMillis()
+            updateStatus(0)
+            return
+        }
         retryDue()
         val items = HubClient.pollOutbox(baseUrl, config.lastAckTs)
         var maxTs = config.lastAckTs
+        val seen = config.snapshotDelivered().toMutableSet()
         for (item in items) {
-            deliver(item)
+            // App-side echo guard: never execute a messageId twice, even if
+            // the server ever serves it again. Matches the seen-restore
+            // pattern used for ingress ids.
+            if (Dedupe.shouldDeliver(seen, item.messageId)) {
+                deliver(item)
+                seen.add(item.messageId)
+            }
             if (item.ts > maxTs) maxTs = item.ts
         }
         config.lastAckTs = maxTs
@@ -84,6 +99,7 @@ class PollService : Service() {
         // as its own verdict — never as delivered.
         if (config.dryRun) {
             HubClient.ack(config.coreBaseUrl, item.messageId, true, mode = "dry-run")
+            config.markDelivered(item.messageId)
             return
         }
         // ① Pacing first: quiet hours, daily cap, per-room cooldown + jitter.
@@ -105,6 +121,7 @@ class PollService : Service() {
             } else {
                 // quiet-hours / daily-cap: not retryable right now, record and drop.
                 HubClient.ack(config.coreBaseUrl, item.messageId, false, pace.reason)
+                config.markDelivered(item.messageId)
             }
             return
         }
@@ -118,6 +135,7 @@ class PollService : Service() {
         if (result.ok) {
             config.recordSend(room, now, dayOf(calendar))
             HubClient.ack(config.coreBaseUrl, item.messageId, true)
+            config.markDelivered(item.messageId)
         } else {
             enqueueRetry(item, room, result.error)
         }
@@ -139,6 +157,7 @@ class PollService : Service() {
             queue.remove(job)
             if (job.tries >= config.maxRetry) {
                 HubClient.ack(config.coreBaseUrl, job.messageId, false, "retry-exhausted")
+                config.markDelivered(job.messageId)
                 continue
             }
             val found = ReplySender.findNotification(listener(), job.room)
@@ -149,6 +168,7 @@ class PollService : Service() {
             val result = ReplySender.reply(listener(), found.first, job.body)
             if (result.ok) {
                 HubClient.ack(config.coreBaseUrl, job.messageId, true)
+                config.markDelivered(job.messageId)
             } else {
                 requeue(queue, job, result.error)
             }
@@ -160,6 +180,7 @@ class PollService : Service() {
         val tries = job.tries + 1
         if (tries > config.maxRetry) {
             scope.launch { HubClient.ack(config.coreBaseUrl, job.messageId, false, "retry-exhausted") }
+            config.markDelivered(job.messageId)
             return
         }
         queue.add(job.copy(tries = tries, nextTs = System.currentTimeMillis() + tries * 60_000L))

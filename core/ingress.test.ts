@@ -119,4 +119,33 @@ describe("cowork trust boundary", () => {
     assert.deepEqual(states, ["seen"]);
     assert.ok(!states.includes("delivered"));
   });
+
+  it("never serves ack lines back as send items (outbox echo repro)", async () => {
+    const since = Date.now();
+    const first = await post("/ingress", {
+      origin: "hub",
+      nativeId: "echo-guard-1",
+      lang: "ko",
+      body: "hi",
+    });
+    assert.ok(Array.isArray(first.json.targets));
+    const get = async (since: number): Promise<{ items: Array<{ messageId: string }> }> => {
+      const r = await fetch(`${CORE}/outbox?channel=telegram&since=${since}`);
+      return (await r.json()) as { items: Array<{ messageId: string }> };
+    };
+    const before = await get(since);
+    const item = before.items.find((i) => i.messageId === "hub:echo-guard-1->telegram");
+    assert.ok(item, "fresh send item must be listed");
+    // Deliver it, then consume it: result lines must never re-enter the
+    // queue. (The original verdict-less line remains addressable by the
+    // since-cursor; the app dedupe drops replays — see DedupeTest.)
+    await post("/outbox/ack", { messageId: item.messageId, channel: "telegram", ok: true });
+    await post("/outbox/seen", { messageId: item.messageId, channel: "telegram", consumer: "t" });
+    const after = await get(since);
+    assert.deepEqual(
+      after.items.map((i) => i.messageId),
+      [item.messageId],
+      "only the fresh send line may be listed — no result lines",
+    );
+  });
 });

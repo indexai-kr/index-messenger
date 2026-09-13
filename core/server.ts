@@ -345,16 +345,17 @@ export async function startServer(config: ServerConfig): Promise<void> {
         return;
       }
       // Outbox queue for poll-based adapters (P3 kakao-listener).
-      // Read-only view over the ledger: pending = out entries the adapter
-      // has not acked. Delivery state returns via /outbox/ack and is itself
-      // ledger-logged (delivered / failed) — no new store, no migration.
+      // Read-only view over the ledger: pending = verdict-less out entries
+      // only. Result lines (delivered/failed/dry-run/seen/rate-limited…)
+      // carry a verdict and are NEVER re-emitted as send items — otherwise
+      // acks loop back into sends (outbox echo). No new store, no migration.
       if (req.method === "GET" && typeof req.url === "string" && req.url.startsWith("/outbox")) {
         const query = new URL(req.url, "http://localhost");
         const channel = query.searchParams.get("channel") ?? "";
         const since = Number(query.searchParams.get("since") ?? "0");
         const all = await ledger.readAll();
         const items = all
-          .filter((e) => e.direction === "out" && e.channel === channel && e.ts > since)
+          .filter((e) => e.direction === "out" && e.channel === channel && e.verdict === undefined && e.ts > since)
           .map((e) => ({ messageId: e.messageId, body: e.body, lang: e.lang, ts: e.ts }));
         send(res, 200, { items });
         return;
