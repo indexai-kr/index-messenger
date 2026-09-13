@@ -4,6 +4,7 @@ import android.content.Intent
 import android.os.Bundle
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.RemoteInput
 import kotlinx.coroutines.CoroutineScope
@@ -39,9 +40,17 @@ class KakaoListener : NotificationListenerService() {
         // none of the hub's business — not read, not indexed, not sent
         // anywhere. An empty setting means no room, hence no ingress.
         val bound = config.defaultRoom
-        if (bound.isEmpty() || room != bound) return
-        val items = messagesOf(extras)
-        if (items.isEmpty()) return
+        val matched = bound.isNotEmpty() && room == bound
+        val items = if (matched) messagesOf(extras) else emptyList()
+        // Metadata-only trace for live measurement (logcat): never a room
+        // title, never a sender, never a body. Lengths and counts only.
+        Log.i(
+            TAG,
+            "kakao notif id=${sbn.id} roomMatch=$matched titleLen=${room.length} " +
+                "hasConversationTitle=${extras.getCharSequence("android.conversationTitle") != null} " +
+                "messages=${items.size}",
+        )
+        if (!matched || items.isEmpty()) return
         RoomIndex.put(room, sbn.key)
         scope.launch {
             val baseUrl = config.coreBaseUrl
@@ -57,6 +66,7 @@ class KakaoListener : NotificationListenerService() {
                     senderId = sender,
                     displayName = sender,
                 )
+                Log.i(TAG, "ingress index=$index ok=$ok bodyLen=${text.length}")
                 if (ok) config.markDelivered(nativeId)
             }
         }
@@ -93,6 +103,7 @@ class KakaoListener : NotificationListenerService() {
 
     companion object {
         const val KAKAO_PACKAGE = "com.kakao.talk"
+        const val TAG = "IndexBridge"
     }
 }
 

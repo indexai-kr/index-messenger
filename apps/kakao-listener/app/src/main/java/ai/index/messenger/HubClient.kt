@@ -1,5 +1,6 @@
 package ai.index.messenger
 
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -72,8 +73,13 @@ object HubClient {
                     .put("displayName", displayName),
             )
         return try {
-            Net.postJson("$baseUrl/ingress", payload) in 200..299
-        } catch (_: Exception) {
+            val code = Net.postJson("$baseUrl/ingress", payload)
+            Log.i(TAG, "ingress http=$code")
+            code in 200..299
+        } catch (e: Exception) {
+            // Exception class only — a network failure must be visible in
+            // logcat during measurement, but never carries message data.
+            Log.w(TAG, "ingress failed ${e.javaClass.simpleName}")
             false
         }
     }
@@ -82,7 +88,7 @@ object HubClient {
         return try {
             val raw = Net.getJson("$baseUrl/outbox?channel=kakao&since=$since")
             val items = JSONObject(raw).optJSONArray("items") ?: return emptyList()
-            List(items.length()) { i ->
+            val parsed = List(items.length()) { i ->
                 val o = items.getJSONObject(i)
                 OutboxItem(
                     messageId = o.getString("messageId"),
@@ -91,7 +97,10 @@ object HubClient {
                     ts = o.optLong("ts", 0L),
                 )
             }
-        } catch (_: Exception) {
+            if (parsed.isNotEmpty()) Log.i(TAG, "poll items=${parsed.size} since=$since")
+            parsed
+        } catch (e: Exception) {
+            Log.w(TAG, "poll failed ${e.javaClass.simpleName}")
             emptyList()
         }
     }
@@ -104,9 +113,14 @@ object HubClient {
             .put("error", error)
             .put("mode", mode)
         return try {
-            Net.postJson("$baseUrl/outbox/ack", payload) in 200..299
-        } catch (_: Exception) {
+            val code = Net.postJson("$baseUrl/outbox/ack", payload)
+            Log.i(TAG, "ack ok=$ok mode=${mode.ifEmpty { "-" }} error=${error.ifEmpty { "-" }} http=$code")
+            code in 200..299
+        } catch (e: Exception) {
+            Log.w(TAG, "ack failed ${e.javaClass.simpleName}")
             false
         }
     }
+
+    private const val TAG = "IndexBridge"
 }
