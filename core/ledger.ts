@@ -16,6 +16,18 @@ export interface LedgerEntry {
   translatedBody?: string;
   verdict?: string;
   sender?: SenderInfo;
+  /**
+   * Server-granted provenance of an `out` line: the ingress origin for
+   * hub/cowork sends, "relay" for a whitelisted derived send. Never
+   * supplied by a client.
+   */
+  origin?: string;
+  /**
+   * Native id of the message an executor actually created on the target
+   * platform (delivered acks only). Rebuilt into the echo set at startup
+   * so our own sends are dropped when they come back through ingress.
+   */
+  nativeId?: string;
 }
 
 export class Ledger {

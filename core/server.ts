@@ -14,6 +14,48 @@ export interface ServerConfig {
   bindingsPath: string;
   ledgerPath: string;
   hubOrigin: string;
+  /**
+   * Relay whitelist file (JSON array of `{from, to}` channel pairs).
+   * Absent or empty means every derived send is record-only.
+   */
+  relayPath?: string;
+}
+
+// One directional channel pair whose derived sends may actually go out.
+export interface RelayPair {
+  from: string;
+  to: string;
+}
+
+// Send policy for one `out` copy. The hub is a display sink — its copies
+// are read by the hub screen, never executed by anyone, so they stay
+// verdict-less regardless of origin.
+export type OutPolicy = "send" | "relay" | "record-only";
+
+const HUB = "hub";
+const COWORK = "cowork";
+
+export function outPolicy(origin: string, channel: string, relay: RelayPair[]): OutPolicy {
+  if (channel === HUB) return "send";
+  if (origin === HUB || origin === COWORK) return "send";
+  if (relay.some((pair) => pair.from === origin && pair.to === channel)) return "relay";
+  return "record-only";
+}
+
+// Whitelist loader: missing path -> locked (empty). A malformed file is a
+// configuration error and must fail loudly, never silently open or close.
+export async function loadRelay(path: string | undefined): Promise<RelayPair[]> {
+  if (!path) return [];
+  const raw = await readFile(path, "utf8");
+  const parsed = JSON.parse(raw) as unknown;
+  if (!Array.isArray(parsed)) throw new Error(`relay file ${path}: expected a JSON array`);
+  return parsed.map((entry, index) => {
+    const o = entry as Record<string, unknown>;
+    if (typeof o?.from !== "string" || typeof o?.to !== "string") {
+      throw new Error(`relay file ${path}: entry ${index} needs string from/to`);
+    }
+    return { from: o.from, to: o.to };
+  });
 }
 
 function env(name: string, fallback = ""): string {
@@ -73,7 +115,44 @@ export async function startServer(config: ServerConfig): Promise<void> {
     : new PassthroughProvider();
 
   const router = new Router({ bindings, translate });
+  const relay = await loadRelay(config.relayPath);
   const pending = new Map<string, { to: string; body: string; lang: string }>();
+
+  // Fan-out recorder shared by every ingress path. Policy per copy:
+  //   send        hub/cowork-originated, or a hub display copy -> sendable
+  //   relay       derived, but (origin -> channel) is whitelisted -> sendable,
+  //               server-tagged origin=relay so it is never mistaken for a
+  //               hub send
+  //   record-only every other derived copy: written to the ledger for the
+  //               converged view, carries a verdict so /outbox never serves
+  //               it. This is the "hub-originated sends only" rule in code.
+  async function recordFanout(
+    msg: { id: string; origin: string },
+    sender: SenderInfo | undefined,
+    targets: Array<{ channel: string; lang: string; body: string }>,
+  ): Promise<Array<{ channel: string; policy: OutPolicy }>> {
+    const decisions: Array<{ channel: string; policy: OutPolicy }> = [];
+    for (const copy of targets) {
+      const policy = outPolicy(msg.origin, copy.channel, relay);
+      const outId = `${msg.id}->${copy.channel}`;
+      await ledger.append({
+        ts: Date.now(),
+        direction: "out",
+        channel: copy.channel,
+        messageId: outId,
+        lang: copy.lang,
+        body: copy.body,
+        translatedLang: copy.lang,
+        translatedBody: copy.body,
+        sender,
+        origin: policy === "relay" ? "relay" : msg.origin,
+        ...(policy === "record-only" ? { verdict: "record-only" } : {}),
+      });
+      router.markEmitted(outId);
+      decisions.push({ channel: copy.channel, policy });
+    }
+    return decisions;
+  }
 
   // Idempotency registry: every executed ingress id. Rebuilt from the
   // ledger at startup (fresh in-lines only — marker lines excluded) so a
@@ -163,21 +242,8 @@ export async function startServer(config: ServerConfig): Promise<void> {
           body: msg.body,
           sender,
         });
-        for (const copy of routed.targets) {
-          await ledger.append({
-            ts: Date.now(),
-            direction: "out",
-            channel: copy.channel,
-            messageId: `${msg.id}->${copy.channel}`,
-            lang: copy.lang,
-            body: copy.body,
-            translatedLang: copy.lang,
-            translatedBody: copy.body,
-            sender,
-          });
-          router.markEmitted(`${msg.id}->${copy.channel}`);
-        }
-        send(res, 200, routed);
+        const policies = await recordFanout(msg, sender, routed.targets);
+        send(res, 200, { ...routed, policies });
         return;
       }
       // Cowork ingress: same pipeline, but the origin is server-tagged.
@@ -224,21 +290,8 @@ export async function startServer(config: ServerConfig): Promise<void> {
           body: msg.body,
           sender,
         });
-        for (const copy of routed.targets) {
-          await ledger.append({
-            ts: Date.now(),
-            direction: "out",
-            channel: copy.channel,
-            messageId: `${msg.id}->${copy.channel}`,
-            lang: copy.lang,
-            body: copy.body,
-            translatedLang: copy.lang,
-            translatedBody: copy.body,
-            sender,
-          });
-          router.markEmitted(`${msg.id}->${copy.channel}`);
-        }
-        send(res, 200, { ...routed, stripped });
+        const policies = await recordFanout(msg, sender, routed.targets);
+        send(res, 200, { ...routed, stripped, policies });
         return;
       }
       // Hub outbound with gate: { body, lang }
@@ -344,11 +397,12 @@ export async function startServer(config: ServerConfig): Promise<void> {
         send(res, 200, { confirmed: true });
         return;
       }
-      // Outbox queue for poll-based adapters (P3 kakao-listener).
+      // Outbox queue for poll-based executors (kakao-listener, discord runner).
       // Read-only view over the ledger: pending = verdict-less out entries
       // only. Result lines (delivered/failed/dry-run/seen/rate-limited…)
-      // carry a verdict and are NEVER re-emitted as send items — otherwise
-      // acks loop back into sends (outbox echo). No new store, no migration.
+      // and record-only derived copies carry a verdict and are NEVER
+      // emitted as send items — otherwise acks loop back into sends
+      // (outbox echo) or inbound traffic auto-forwards. No new store.
       if (req.method === "GET" && typeof req.url === "string" && req.url.startsWith("/outbox")) {
         const query = new URL(req.url, "http://localhost");
         const channel = query.searchParams.get("channel") ?? "";
@@ -356,7 +410,7 @@ export async function startServer(config: ServerConfig): Promise<void> {
         const all = await ledger.readAll();
         const items = all
           .filter((e) => e.direction === "out" && e.channel === channel && e.verdict === undefined && e.ts > since)
-          .map((e) => ({ messageId: e.messageId, body: e.body, lang: e.lang, ts: e.ts }));
+          .map((e) => ({ messageId: e.messageId, body: e.body, lang: e.lang, ts: e.ts, origin: e.origin }));
         send(res, 200, { items });
         return;
       }
@@ -434,5 +488,6 @@ if (process.argv[1]?.endsWith("server.ts")) {
     bindingsPath: env("BINDINGS_PATH", "./bindings.example.json"),
     ledgerPath: env("LEDGER_PATH", "./data/ledger.jsonl"),
     hubOrigin: env("HUB_ORIGIN", "http://localhost:5173"),
+    relayPath: env("RELAY_PATH", "") || undefined,
   });
 }
