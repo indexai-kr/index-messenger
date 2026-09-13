@@ -133,6 +133,8 @@ These lines are not traded for convenience.
 
 **No global auto-approve switch, ever.** A button that delegates every approval at once is the death of the gate. Approval burden may be split by risk, but a feature that hands over approval itself wholesale will never exist in this codebase. If the gate falls, this product loses its reason to exist.
 
+**Nothing leaves unless you sent it.** Inbound messages fan out into the ledger for reading, not for sending: every copy derived from another channel is `record-only` in code, and no executor can reach it. The only exception is a relay corridor you wrote down yourself — one explicit `from → to` line per direction, through the same gate, pacing and ledger. There is no automatic forwarding between channels, and an empty whitelist is the default.
+
 **Personal messenger adapters are free forever.** The KakaoTalk listener and other personal-account adapters will not be sold, and installation will not be done for a fee. They remain commons.
 
 **Limits are not hidden.** Needing a powered-on device, missing muted rooms, truncated long messages, translations that miss meaning — all of it is in the docs. A stated limit is a specification, not a defect.

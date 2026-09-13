@@ -100,3 +100,11 @@ Clients of this gateway are not exempt from anything: hub-originated
 sends only, the approval gate on every send, adapter-edge pacing
 (same-room interval, quiet hours, daily cap), and full ledger logging.
 A client that needs an exception does not get one — it gets rejected.
+
+The single exception to "hub-originated sends only" is a relay pair the
+operator wrote into `RELAY_PATH` (see `docs/architecture.md`, *Relay*):
+a named `(from -> to)` corridor whose derived copies go out server-tagged
+`origin=relay`, through the same gate, pacing and ledger. Every other
+derived copy is `record-only` and never appears in `/outbox`. This is
+not automatic forwarding between channels — it is one explicit line per
+direction, and it is empty unless the operator says otherwise.
