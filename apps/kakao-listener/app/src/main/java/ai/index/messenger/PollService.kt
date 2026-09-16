@@ -81,23 +81,83 @@ class PollService : Service() {
             updateStatus(0)
             return
         }
-        retryDue()
         val items = HubClient.pollOutbox(baseUrl, config.lastAckTs)
         var maxTs = config.lastAckTs
         val seen = config.snapshotDelivered().toMutableSet()
-        val queued = readQueue().map { it.messageId }.toSet()
+        val queue = readQueue().toMutableList()
+        val queued = queue.map { it.messageId }.toSet()
+        val now = System.currentTimeMillis()
+        val fresh = mutableListOf<RetryJob>()
         for (item in items) {
             // App-side echo guard: never execute a messageId twice, even if
             // the server ever serves it again — and never start a second
             // attempt for one that is already waiting in the retry queue.
             if (Dedupe.shouldDeliver(seen, item.messageId) && item.messageId !in queued) {
-                attempt(RetryJob(item.messageId, item.body, config.defaultRoom, tries = 0, nextTs = 0L), fromQueue = false)
+                fresh.add(RetryJob(item.messageId, item.body, config.defaultRoom, tries = 0, nextTs = now))
                 seen.add(item.messageId)
             }
             if (item.ts > maxTs) maxTs = item.ts
         }
+        // Everything that may go now — due retries and fresh items — is
+        // one batch: one reply action, one pacing slot, every line.
+        val due = queue.filter { it.nextTs <= now }
+        val batch = due + fresh
+        if (batch.isNotEmpty()) {
+            queue.removeAll(due)
+            val steps = attemptBatch(batch)
+            for (step in steps) if (step is RetryStep.Requeue) queue.add(step.job)
+            for (evicted in RetryPlanner.overflow(queue, MAX_QUEUE)) {
+                queue.remove(evicted)
+                settle(evicted.messageId, ok = false, error = "queue-overflow")
+            }
+            writeQueue(queue)
+        }
         config.lastAckTs = maxTs
         updateStatus(items.size)
+    }
+
+    // One reply for the whole batch. Checks run once (dry-run, pacing, room
+    // resolution); the outcome applies to every job in it: all settled
+    // on success, all requeued on a hold or a failure.
+    private suspend fun attemptBatch(jobs: List<RetryJob>): List<RetryStep> {
+        if (jobs.size == 1) return listOfNotNull(attempt(jobs[0], fromQueue = true))
+        val room = config.defaultRoom
+        val now = System.currentTimeMillis()
+        if (room.isEmpty() || config.dryRun) {
+            // Same per-job handling as a single attempt; nothing is sent.
+            return jobs.mapNotNull { attempt(it, fromQueue = true) }
+        }
+        val calendar = java.util.Calendar.getInstance()
+        val pace = config.paceCheck(
+            room = room,
+            nowMs = now,
+            hour = calendar.get(java.util.Calendar.HOUR_OF_DAY),
+            day = dayOf(calendar),
+        )
+        if (!pace.allowed) {
+            if (pace.reason == "cooling-down") {
+                return jobs.map { job ->
+                    val step = RetryPlanner.afterCooldown(job, pace.waitMs, now)
+                    HubClient.ack(config.coreBaseUrl, job.messageId, false, "cooling-down")
+                    step
+                }
+            }
+            jobs.forEach { settle(it.messageId, ok = false, error = pace.reason) }
+            return emptyList()
+        }
+        val found = ReplySender.findNotification(listener(), room)
+        if (found == null) {
+            val error = ReplySender.resolutionError(room) ?: "no-notification-for-room"
+            return jobs.mapNotNull { job -> schedule(RetryPlanner.afterFailure(job, error, config.maxRetry, now), fromQueue = true) }
+        }
+        val result = ReplySender.reply(listener(), found.first, RetryPlanner.batchBody(jobs))
+        return if (result.ok) {
+            config.recordSend(room, now, dayOf(calendar))
+            jobs.forEach { settle(it.messageId, ok = true) }
+            emptyList()
+        } else {
+            jobs.mapNotNull { job -> schedule(RetryPlanner.afterFailure(job, result.error, config.maxRetry, now), fromQueue = true) }
+        }
     }
 
     // The single delivery path. Returns the step the job takes next, or
@@ -164,7 +224,8 @@ class PollService : Service() {
                 return null
             }
             is RetryStep.Requeue -> {
-                if (!fromQueue) enqueue(step.job)
+                // The caller (pollOnce) owns the queue for this pass and
+                // re-inserts requeued jobs; nothing is written from here.
                 HubClient.ack(config.coreBaseUrl, step.job.messageId, false, step.error)
                 return step
             }
@@ -182,30 +243,6 @@ class PollService : Service() {
             calendar.get(java.util.Calendar.MONTH) + 1,
             calendar.get(java.util.Calendar.DAY_OF_MONTH),
         )
-
-    private suspend fun retryDue() {
-        val now = System.currentTimeMillis()
-        val queue = readQueue().toMutableList()
-        val due = queue.filter { it.nextTs <= now }
-        if (due.isEmpty()) return
-        for (job in due) {
-            queue.remove(job)
-            val step = attempt(job, fromQueue = true)
-            if (step is RetryStep.Requeue) queue.add(step.job)
-        }
-        writeQueue(queue)
-    }
-
-    private suspend fun enqueue(job: RetryJob) {
-        val queue = readQueue().toMutableList()
-        queue.add(job)
-        // Overflow is a reported outcome, not a silent drop.
-        for (evicted in RetryPlanner.overflow(queue, MAX_QUEUE)) {
-            queue.remove(evicted)
-            settle(evicted.messageId, ok = false, error = "queue-overflow")
-        }
-        writeQueue(queue)
-    }
 
     private fun readQueue(): List<RetryJob> {
         val prefs = getSharedPreferences("index_retry", Context.MODE_PRIVATE)

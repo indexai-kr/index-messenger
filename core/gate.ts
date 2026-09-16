@@ -1,6 +1,10 @@
 // Outbound gate (P2): hold messages that carry high-risk patterns
-// (numbers, amounts, dates, addresses) for human confirmation.
-// Everything else passes automatically. Every verdict is ledger-logged.
+// (amounts, times, dates, addresses) for human confirmation, or whose
+// translation lost a structural token. Everything else passes — a bare
+// number ("25", "20분 뒤") is not a reason to hold; it is a token that
+// must survive translation, and tokensPreserved() enforces that. Typos
+// are sent as translated, never corrected: the source is immutable.
+// Every verdict is ledger-logged.
 
 export type GateVerdict = "pass" | "hold";
 
@@ -26,7 +30,6 @@ const PATTERNS: Array<{ name: string; re: RegExp }> = [
       "i",
     ),
   },
-  { name: "number", re: /\d{2,}/ },
   {
     name: "time",
     re: /(\d{1,2}\s*시|\d{1,2}:\d{2}|내일|모레|오늘\s*(?:밤|저녁|아침|오후|오전)|다음\s?주|\d{1,2}\s?(?:am|pm)(?![a-z])|(?:^|[^a-z])at\s+\d{1,2}(?![\d:])|(?:^|[^a-z])(?:tomorrow|tonight|next\s+(?:week|month|mon|tue|wed|thu|fri|sat|sun))(?![a-z])|明日|明後日|来週|\d{1,2}時)/i,

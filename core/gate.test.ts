@@ -40,6 +40,15 @@ describe("gate patterns", () => {
     }
   });
 
+  it("a bare number or a typo is not held; explicit money still is", () => {
+    for (const text of ["can you send me 25doral", "방 번호 302", "12개 샀어"]) {
+      assert.deepEqual(inspect(text), [], `no hold expected in: ${text}`);
+    }
+    assert.deepEqual(inspectCopy("can you send me 25doral", "25도랄을 보내줄 수 있나요?"), []);
+    assert.ok(inspect("can you send me 25 dollars").includes("amount"));
+    assert.ok(inspect("5만원만").includes("amount"));
+  });
+
   it("times and dates in English and Japanese", () => {
     for (const text of ["tomorrow at 3", "see you at 7", "9pm tonight", "next week", "明日3時", "来週"]) {
       assert.ok(inspect(text).includes("time"), `time expected in: ${text}`);

@@ -28,6 +28,12 @@ object RetryPlanner {
     fun afterCooldown(job: RetryJob, waitMs: Long, nowMs: Long): RetryStep =
         RetryStep.Requeue(job.copy(nextTs = nowMs + waitMs.coerceAtLeast(1_000L)), "cooling-down")
 
+    // One notification reply carries every job waiting for that room:
+    // the reply action is consumed by a single send, so waiting jobs go
+    // out together, oldest first, one per line.
+    fun batchBody(jobs: List<RetryJob>): String =
+        jobs.sortedBy { it.nextTs }.joinToString("\n") { it.body }
+
     /** Jobs that must be dropped to make room, oldest first. */
     fun overflow(queue: List<RetryJob>, max: Int): List<RetryJob> =
         if (queue.size <= max) emptyList() else queue.sortedBy { it.nextTs }.take(queue.size - max)

@@ -35,6 +35,15 @@ class RetryPlannerTest {
     }
 
     @Test
+    fun `a batch is one reply, oldest first, one line per job`() {
+        val jobs = listOf(
+            job.copy(messageId = "b", body = "second", nextTs = 20L),
+            job.copy(messageId = "a", body = "first", nextTs = 10L),
+        )
+        assertEquals("first\nsecond", RetryPlanner.batchBody(jobs))
+    }
+
+    @Test
     fun `overflow names the oldest jobs to drop, never silently`() {
         val queue = (1..23).map { job.copy(messageId = "m$it", nextTs = it.toLong()) }
         val evicted = RetryPlanner.overflow(queue, max = 20)

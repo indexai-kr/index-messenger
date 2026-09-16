@@ -43,7 +43,11 @@ export class OpenAICompatibleProvider implements TranslateProvider {
           messages: [
             {
               role: "system",
-              content: `Translate the user text from ${from} to ${to}. Reply with the translation only, no explanations.`,
+              content:
+                `Translate the user text from ${from} to ${to}. Reply with the translation only, no explanations. ` +
+                `Translate idioms and slang by meaning, not word for word. If the text has a typo, translate the most ` +
+                `likely intended meaning without commenting on it. Keep numbers, amounts, dates, names, URLs and ` +
+                `bracketed tags exactly as written. Keep the register (casual stays casual, polite stays polite).`,
             },
             { role: "user", content: text },
           ],
