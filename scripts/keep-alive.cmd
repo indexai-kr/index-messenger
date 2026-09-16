@@ -14,5 +14,5 @@ goto collect
 echo [%LABEL%] %date% %time% starting: %CMD%
 %CMD%
 echo [%LABEL%] %date% %time% exited (code %errorlevel%), restarting in 5 s...
-%SystemRoot%System32	imeout.exe /t 5 /nobreak >nul
+ping -n 6 127.0.0.1 >nul
 goto run
