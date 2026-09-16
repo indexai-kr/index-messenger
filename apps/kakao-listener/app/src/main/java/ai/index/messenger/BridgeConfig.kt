@@ -105,6 +105,12 @@ class BridgeConfig(context: Context) {
         else hour >= quietStart || hour < quietEnd
     }
 
+    // Newest KakaoTalk message time already handed to the hub. Messages at
+    // or before it are history carried by a re-posted notification.
+    var ingressFloorTs: Long
+        get() = prefs.getLong(KEY_INGRESS_FLOOR, 0L)
+        set(v) = prefs.edit().putLong(KEY_INGRESS_FLOOR, v).apply()
+
     var lastAckTs: Long
         get() = prefs.getLong(KEY_SINCE, -1L)
         set(v) = prefs.edit().putLong(KEY_SINCE, v).apply()
@@ -137,6 +143,7 @@ class BridgeConfig(context: Context) {
         private const val KEY_MAX_RETRY = "max_retry"
         private const val KEY_ROOM = "default_room"
         private const val KEY_SINCE = "last_ack_ts"
+        private const val KEY_INGRESS_FLOOR = "ingress_floor_ts"
         private const val KEY_BACKFILL = "allow_backfill"
         private const val KEY_DELIVERED = "delivered_ids"
         private const val KEY_SAME_ROOM = "same_room_secs"

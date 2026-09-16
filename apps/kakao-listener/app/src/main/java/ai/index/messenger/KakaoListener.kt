@@ -55,20 +55,30 @@ class KakaoListener : NotificationListenerService() {
         scope.launch {
             val baseUrl = config.coreBaseUrl
             if (baseUrl.isEmpty()) return@launch
-            items.forEachIndexed { index, (sender, text) ->
-                val nativeId = "${sbn.key}:${sbn.postTime}:$index"
+            val floor = config.ingressFloorTs
+            var newest = floor
+            items.forEachIndexed { index, msg ->
+                // A message without its own time falls back to the post
+                // time (single-text notifications); bundled ones carry it.
+                val time = if (msg.time > 0L) msg.time else sbn.postTime
+                if (!Dedupe.fresh(time, floor)) return@forEachIndexed
+                val nativeId = Dedupe.nativeId(sbn.key, time, msg.sender, msg.text)
                 if (config.isDelivered(nativeId)) return@forEachIndexed
                 val ok = HubClient.ingress(
                     baseUrl = baseUrl,
                     nativeId = nativeId,
                     lang = "ko",
-                    body = text,
-                    senderId = sender,
-                    displayName = sender,
+                    body = msg.text,
+                    senderId = msg.sender,
+                    displayName = msg.sender,
                 )
-                Log.i(TAG, "ingress index=$index ok=$ok bodyLen=${text.length}")
-                if (ok) config.markDelivered(nativeId)
+                Log.i(TAG, "ingress index=$index ok=$ok bodyLen=${msg.text.length}")
+                if (ok) {
+                    config.markDelivered(nativeId)
+                    if (time > newest) newest = time
+                }
             }
+            if (newest > floor) config.ingressFloorTs = newest
         }
     }
 
@@ -87,18 +97,18 @@ class KakaoListener : NotificationListenerService() {
     // Bundled MessagingStyle messages first (a burst in one room arrives as
     // several — inject every undelivered one, not just the last), then the
     // single-text fallback.
-    private fun messagesOf(extras: Bundle): List<Pair<String, String>> {
+    private fun messagesOf(extras: Bundle): List<KakaoMessage> {
         val bundled = extras.getParcelableArray("android.messages")
             ?.mapNotNull { it as? Bundle }
             ?.mapNotNull { b ->
                 val text = b.getCharSequence("text")?.toString() ?: return@mapNotNull null
                 val sender = b.getCharSequence("sender")?.toString() ?: "unknown"
-                sender to text
+                KakaoMessage(sender, text, b.getLong("time", 0L))
             }
         if (!bundled.isNullOrEmpty()) return bundled
         val text = extras.getCharSequence("android.text")?.toString() ?: return emptyList()
         val sender = extras.getCharSequence("android.title")?.toString() ?: "unknown"
-        return listOf(sender to text)
+        return listOf(KakaoMessage(sender, text, 0L))
     }
 
     companion object {
@@ -106,6 +116,8 @@ class KakaoListener : NotificationListenerService() {
         const val TAG = "IndexBridge"
     }
 }
+
+data class KakaoMessage(val sender: String, val text: String, val time: Long)
 
 // Notification keys per room title. Titles are NOT unique — two rooms can
 // share a name, and replying would hit the wrong one. Callers must treat
