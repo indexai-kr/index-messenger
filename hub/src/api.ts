@@ -61,9 +61,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ body, lang }),
     }),
-  confirm: (id: string, body?: string) =>
+  // Approval is by id only: the server releases the text it held, never
+  // a text supplied here.
+  confirm: (id: string) =>
     call<{ confirmed: boolean }>("/confirm", {
       method: "POST",
-      body: JSON.stringify({ id, body }),
+      body: JSON.stringify({ id }),
     }),
 };

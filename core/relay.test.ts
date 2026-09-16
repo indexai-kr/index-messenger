@@ -172,6 +172,31 @@ describe("relay kakao <-> discord", () => {
     assert.equal(lines.find((e) => e.verdict === "confirmed" && e.messageId === "kakao:g-1->discord")?.channel, "discord");
   });
 
+  it("confirm binds to the reviewed text: a body in the request is rejected, nothing is released", async () => {
+    await post(core!.base, "/ingress", { origin: "kakao", nativeId: "g-2", lang: "en", body: "send 120,000 KRW" });
+    const id = "kakao:g-2->discord";
+    const r = await fetch(`${core!.base}/confirm`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id, body: "완전히 다른 문장" }),
+    });
+    assert.equal(r.status, 400);
+    assert.ok(!(await outbox(core!.base, "discord")).includes(id), "rejected confirm releases nothing");
+    const lines = await ledger(core!);
+    assert.equal(outLine(lines, id), undefined);
+    assert.equal(lines.some((e) => e.body === "완전히 다른 문장"), false, "substituted text never touches the ledger");
+    // Still pending: a proper confirm releases exactly the held text.
+    const c = await post(core!.base, "/confirm", { id });
+    assert.equal(c.confirmed, true);
+    assert.equal(outLine(await ledger(core!), id)?.body, "[ko] send 120,000 KRW");
+    const noId = await fetch(`${core!.base}/confirm`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    assert.equal(noId.status, 400);
+  });
+
   it("loop guard: a delivered native id coming back through ingress is dropped as echo", async () => {
     await post(core!.base, "/ingress", { origin: "kakao", nativeId: "k-3", lang: "en", body: "ping" });
     // The discord executor sent kakao:k-3->discord and Discord assigned it id d-777.

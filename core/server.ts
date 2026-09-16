@@ -453,15 +453,27 @@ export async function startServer(config: ServerConfig): Promise<void> {
         send(res, 200, { held: true, id, matched, roundTrips });
         return;
       }
+      // Confirmation binds to the exact text that was reviewed. The request
+      // carries the pending id only: a body in the request is rejected,
+      // never substituted, so a caller cannot approve one sentence and
+      // release another. Edits go back through /send (re-inspect, re-hold).
       if (req.method === "POST" && req.url === "/confirm") {
-        const event = (await readJson(req)) as { id: string; body?: string };
+        const event = ((await readJson(req)) ?? {}) as Record<string, unknown>;
+        if (typeof event.id !== "string") {
+          send(res, 400, { error: "id is required" });
+          return;
+        }
+        if ("body" in event) {
+          send(res, 400, { error: "confirm takes the pending id only; edit via /send" });
+          return;
+        }
         const held = pending.get(event.id);
         if (!held) {
           send(res, 404, { error: "unknown pending id" });
           return;
         }
         pending.delete(event.id);
-        const body = event.body ?? held.body;
+        const body = held.body;
         const isRelay = held.to !== "fanout";
         await ledger.append({
           ts: Date.now(),
