@@ -172,6 +172,28 @@ describe("relay kakao <-> discord", () => {
     assert.equal(lines.find((e) => e.verdict === "confirmed" && e.messageId === "kakao:g-1->discord")?.channel, "discord");
   });
 
+  it("cowork and hub ingress copies pass the same gate as relay copies", async () => {
+    const cw = await post(core!.base, "/cowork/ingress", { nativeId: "cw-pay", lang: "en", body: "pay 100 USD" });
+    const cwPolicies = cw.policies as Array<{ channel: string; policy: string; matched?: string[] }>;
+    const cwDiscord = cwPolicies.find((p) => p.channel === "discord");
+    assert.equal(cwDiscord?.policy, "held");
+    assert.ok(cwDiscord?.matched?.includes("amount"));
+    assert.equal(cwPolicies.find((p) => p.channel === "hub")?.policy, "send", "hub display copy is never held");
+    assert.ok(!(await outbox(core!.base, "discord")).includes("cowork:cw-pay->discord"));
+    const hub = await post(core!.base, "/ingress", { origin: "hub", nativeId: "h-time", lang: "ko", body: "내일 3시" });
+    const hubPolicies = hub.policies as Array<{ channel: string; policy: string }>;
+    assert.equal(hubPolicies.find((p) => p.channel === "kakao")?.policy, "held");
+    assert.ok(!(await outbox(core!.base, "kakao")).includes("hub:h-time->kakao"));
+    const pend = (await (await fetch(`${core!.base}/pending`)).json()) as { items: Array<{ id: string; origin?: string; source: string }> };
+    const item = pend.items.find((i) => i.id === "cowork:cw-pay->discord");
+    assert.equal(item?.origin, "cowork");
+    assert.equal(item?.source, "pay 100 USD");
+    const c = await post(core!.base, "/confirm", { id: "cowork:cw-pay->discord" });
+    assert.equal(c.released, "discord");
+    assert.ok((await outbox(core!.base, "discord")).includes("cowork:cw-pay->discord"));
+    assert.equal(outLine(await ledger(core!), "cowork:cw-pay->discord")?.origin, "cowork");
+  });
+
   it("confirm binds to the reviewed text: a body in the request is rejected, nothing is released", async () => {
     await post(core!.base, "/ingress", { origin: "kakao", nativeId: "g-2", lang: "en", body: "send 120,000 KRW" });
     const id = "kakao:g-2->discord";

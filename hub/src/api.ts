@@ -49,8 +49,9 @@ export interface SendResult {
 
 export interface PendingItem {
   id: string;
-  kind: "relay" | "fanout";
+  kind: "copy" | "draft";
   to?: string;
+  origin?: string;
   lang: string;
   body?: string;
   source: string;

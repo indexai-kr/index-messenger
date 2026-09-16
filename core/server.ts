@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { readFile } from "node:fs/promises";
 import { Router, type BindingTable } from "./router.ts";
 import { Ledger, type LedgerEntry } from "./ledger.ts";
-import { inspect } from "./gate.ts";
+import { inspect, inspectCopy } from "./gate.ts";
 import { pLimit } from "./p-limit.ts";
 import {
   OpenAICompatibleProvider,
@@ -144,22 +144,29 @@ const TRUST_FIELDS = [
 // patterns that held it — both are review context, not send data.
 export type Pending =
   | {
-      kind: "relay";
+      /** One held copy on its way to one channel (relay, hub or cowork origin). */
+      kind: "copy";
       to: string;
       body: string;
       lang: string;
       sender?: SenderInfo;
+      origin: string;
       source: string;
       matched: string[];
     }
   | {
-      kind: "fanout";
+      /** A hub draft held as a whole: every channel copy waits together. */
+      kind: "draft";
       body: string;
       lang: string;
       copies: Array<{ channel: string; lang: string; body: string }>;
       source: string;
       matched: string[];
     };
+
+// Ledger origin tag of a draft's gate lines. Distinct from "hub" (an
+// individual hub-originated copy) so a restart can tell the two apart.
+const DRAFT = "draft";
 
 interface RoundTrip {
   channel: string;
@@ -171,9 +178,19 @@ interface RoundTrip {
 }
 
 function pendingView(id: string, held: Pending): Record<string, unknown> {
-  return held.kind === "relay"
-    ? { id, kind: "relay", to: held.to, lang: held.lang, body: held.body, source: held.source, matched: held.matched, sender: held.sender }
-    : { id, kind: "fanout", lang: held.lang, source: held.source, matched: held.matched, copies: held.copies };
+  return held.kind === "copy"
+    ? {
+        id,
+        kind: "copy",
+        to: held.to,
+        origin: held.origin,
+        lang: held.lang,
+        body: held.body,
+        source: held.source,
+        matched: held.matched,
+        sender: held.sender,
+      }
+    : { id, kind: "draft", lang: held.lang, source: held.source, matched: held.matched, copies: held.copies };
 }
 
 // Hub-originated ids: millisecond time plus a per-process counter, so two
@@ -185,8 +202,8 @@ function nextHubNativeId(): string {
 }
 
 // Rebuild the pending map from the ledger: every gate|hold line whose id
-// has no later confirmed/rejected line is still waiting. Relay holds are
-// keyed by their out id; hub holds (origin=hub) are grouped per draft
+// has no later confirmed/rejected line is still waiting. Copy holds are
+// keyed by their out id; draft holds (origin=draft) are grouped per draft
 // under the draft id, one copy per channel line. Legacy hub holds that
 // predate the origin tag are not resurrected — they were never
 // confirmable across a restart, and they belong to no live screen.
@@ -196,37 +213,36 @@ export function rebuildPending(history: LedgerEntry[]): Map<string, Pending> {
     if (e.direction === "gate" && (e.verdict === "confirmed" || e.verdict === "rejected")) decided.add(e.messageId);
   }
   const out = new Map<string, Pending>();
-  const drafts = new Map<string, Pending & { kind: "fanout" }>();
+  const drafts = new Map<string, Pending & { kind: "draft" }>();
   for (const e of history) {
-    if (e.direction !== "gate" || e.verdict !== "hold") continue;
-    if (e.origin === "relay") {
-      if (decided.has(e.messageId)) continue;
-      const arrow = e.messageId.lastIndexOf("->");
-      if (arrow < 0) continue;
-      out.set(e.messageId, {
-        kind: "relay",
-        to: e.channel,
-        body: e.body,
-        lang: e.lang,
-        sender: e.sender,
-        source: "",
-        matched: [],
-      });
-      continue;
-    }
-    if (e.origin === HUB) {
-      const arrow = e.messageId.lastIndexOf("->");
-      if (arrow < 0) continue;
+    if (e.direction !== "gate" || e.verdict !== "hold" || e.origin === undefined) continue;
+    const arrow = e.messageId.lastIndexOf("->");
+    if (arrow < 0) continue;
+    if (e.origin === DRAFT) {
       const draftId = e.messageId.slice(0, arrow);
       if (decided.has(draftId)) continue;
       let draft = drafts.get(draftId);
       if (draft === undefined) {
-        draft = { kind: "fanout", body: "", lang: "", copies: [], source: "", matched: [] };
+        draft = { kind: "draft", body: "", lang: "", copies: [], source: "", matched: [] };
         drafts.set(draftId, draft);
       }
       draft.copies = draft.copies.filter((c) => c.channel !== e.channel);
       draft.copies.push({ channel: e.channel, lang: e.lang, body: e.body });
+      continue;
     }
+    if (decided.has(e.messageId)) continue;
+    const sourceId = e.messageId.slice(0, arrow);
+    const inbound = history.find((h) => h.direction === "in" && h.messageId === sourceId && h.verdict === undefined);
+    out.set(e.messageId, {
+      kind: "copy",
+      to: e.channel,
+      body: e.body,
+      lang: e.lang,
+      sender: e.sender,
+      origin: e.origin,
+      source: inbound?.body ?? "",
+      matched: [],
+    });
   }
   // The draft's own text is its inbound hub line.
   for (const [draftId, draft] of drafts) {
@@ -281,9 +297,11 @@ export async function startServer(config: ServerConfig): Promise<void> {
   //   record-only every other derived copy: written to the ledger for the
   //               converged view, carries a verdict so /outbox never serves
   //               it. This is the "hub-originated sends only" rule in code.
-  // A relay copy is not exempt from the L4 gate: risk patterns in the
-  // source or the translated text hold it (gate|hold + pending) until
-  // POST /confirm releases it. Hub sends pass the same gate via /send.
+  // Every copy that can actually leave — send or relay, any origin — goes
+  // through the same gate: risk patterns in the source or the translated
+  // text, or a structural token the translation lost, hold it (gate|hold
+  // + pending) until POST /confirm releases it. The hub display copy is
+  // read by the hub screen only and is never executed, so it is not held.
   async function recordFanout(
     msg: { id: string; origin: string; body: string },
     sender: SenderInfo | undefined,
@@ -297,8 +315,9 @@ export async function startServer(config: ServerConfig): Promise<void> {
     for (const copy of targets) {
       const policy = outPolicy(msg.origin, copy.channel, relay);
       const outId = `${msg.id}->${copy.channel}`;
-      if (policy === "relay" && !approved) {
-        const matched = [...new Set([...inspect(msg.body), ...inspect(copy.body)])];
+      const origin = policy === "relay" ? "relay" : msg.origin;
+      if (policy !== "record-only" && copy.channel !== HUB && !approved) {
+        const matched = inspectCopy(msg.body, copy.body);
         if (matched.length > 0) {
           await ledger.append({
             ts: Date.now(),
@@ -310,15 +329,16 @@ export async function startServer(config: ServerConfig): Promise<void> {
             translatedLang: copy.lang,
             translatedBody: copy.body,
             sender,
-            origin: "relay",
+            origin,
             verdict: "hold",
           });
           pending.set(outId, {
-            kind: "relay",
+            kind: "copy",
             to: copy.channel,
             body: copy.body,
             lang: copy.lang,
             sender,
+            origin,
             source: msg.body,
             matched,
           });
@@ -336,7 +356,7 @@ export async function startServer(config: ServerConfig): Promise<void> {
         translatedLang: copy.lang,
         translatedBody: copy.body,
         sender,
-        origin: policy === "relay" ? "relay" : msg.origin,
+        origin,
         ...(policy === "record-only" ? { verdict: "record-only" } : {}),
       });
       router.markEmitted(outId);
@@ -586,8 +606,12 @@ export async function startServer(config: ServerConfig): Promise<void> {
             origin: HUB,
             verdict: "pass",
           });
+          // The source carried nothing risky, but a translation still can
+          // (a lost tag, an invented number): those copies are held one
+          // by one and show up in /pending.
           const policies = await recordFanout(msg, undefined, copies);
-          send(res, 200, { held: false, id, matched, roundTrips: [], policies });
+          const held = policies.some((p) => p.policy === "held");
+          send(res, 200, { held, id, matched, roundTrips: [], policies });
           return;
         }
         // Hold: one gate line per channel carrying the exact string that
@@ -603,11 +627,11 @@ export async function startServer(config: ServerConfig): Promise<void> {
             body: r.translated,
             translatedLang: hubLang,
             translatedBody: r.backTranslation,
-            origin: HUB,
+            origin: DRAFT,
             verdict: "hold",
           });
         }
-        pending.set(id, { kind: "fanout", body: msg.body, lang: msg.lang, copies, source: msg.body, matched });
+        pending.set(id, { kind: "draft", body: msg.body, lang: msg.lang, copies, source: msg.body, matched });
         send(res, 200, { held: true, id, matched, roundTrips });
         return;
       }
@@ -640,17 +664,17 @@ export async function startServer(config: ServerConfig): Promise<void> {
         await ledger.append({
           ts: Date.now(),
           direction: "gate",
-          channel: held.kind === "relay" ? held.to : HUB,
+          channel: held.kind === "copy" ? held.to : HUB,
           messageId: event.id,
           lang: held.lang,
           body: held.body,
-          origin: held.kind === "relay" ? "relay" : HUB,
+          origin: held.kind === "copy" ? held.origin : DRAFT,
           verdict: "confirmed",
         });
         let released: string[];
-        if (held.kind === "relay") {
-          // A confirmed relay copy becomes the sendable out line it would
-          // have been without the hold — same shape, same /outbox path.
+        if (held.kind === "copy") {
+          // A confirmed copy becomes the sendable out line it would have
+          // been without the hold — same shape, same /outbox path.
           await ledger.append({
             ts: Date.now(),
             direction: "out",
@@ -661,7 +685,7 @@ export async function startServer(config: ServerConfig): Promise<void> {
             translatedLang: held.lang,
             translatedBody: held.body,
             sender: held.sender,
-            origin: "relay",
+            origin: held.origin,
           });
           router.markEmitted(event.id);
           released = [held.to];
@@ -673,7 +697,7 @@ export async function startServer(config: ServerConfig): Promise<void> {
           released = policies.map((p) => p.channel);
         }
         pending.delete(event.id);
-        send(res, 200, { confirmed: true, released: held.kind === "relay" ? held.to : undefined, channels: released });
+        send(res, 200, { confirmed: true, released: held.kind === "copy" ? held.to : undefined, channels: released });
         return;
       }
       // Rejection: the held text is dropped, nothing goes out, the verdict
@@ -692,11 +716,11 @@ export async function startServer(config: ServerConfig): Promise<void> {
         await ledger.append({
           ts: Date.now(),
           direction: "gate",
-          channel: held.kind === "relay" ? held.to : HUB,
+          channel: held.kind === "copy" ? held.to : HUB,
           messageId: event.id,
           lang: held.lang,
           body: "",
-          origin: held.kind === "relay" ? "relay" : HUB,
+          origin: held.kind === "copy" ? held.origin : DRAFT,
           verdict: "rejected",
         });
         pending.delete(event.id);

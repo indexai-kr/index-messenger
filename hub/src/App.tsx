@@ -127,12 +127,12 @@ function formatLine(e: LedgerEntry): string {
           {pending.map((p) => (
             <li key={p.id}>
               <div>
-                [{p.kind === "relay" ? `relay → ${p.to}` : "hub 발신"}] 감지: {p.matched.join(", ") || "-"}
+                [{p.kind === "copy" ? `${p.origin ?? "?"} → ${p.to}` : "hub 발신"}] 감지: {p.matched.join(", ") || "-"}
                 {p.sender !== undefined ? ` · ${p.sender.displayName}` : ""}
               </div>
               <div>원문: {p.source}</div>
-              {p.kind === "relay" && <div>발신 예정({p.lang}): {p.body}</div>}
-              {p.kind === "fanout" && (
+              {p.kind === "copy" && <div>발신 예정({p.lang}): {p.body}</div>}
+              {p.kind === "draft" && (
                 <ul>
                   {(p.copies ?? []).map((c) => (
                     <li key={c.channel}>
