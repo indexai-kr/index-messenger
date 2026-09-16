@@ -10,6 +10,7 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -22,14 +23,21 @@ import org.json.JSONObject
 // answers through the room's notification reply action. Hub-originated
 // traffic only — nothing else is ever sent.
 //
+// One delivery path. A message coming straight from the outbox and a
+// message coming back from the retry queue go through the same
+// attempt(): dry-run switch, pacing (quiet hours, daily cap, per-room
+// cooldown), room resolution, reply, send bookkeeping. Nothing can be
+// sent through a side door that skips a check.
+//
 // Retry policy: failures stay in a capped on-device queue (20 items max,
-// bodies dropped after MAX attempts). No unbounded accumulation, no
-// plaintext message log files — the ledger on the hub is the record.
+// bodies dropped after MAX attempts). Overflow is reported to the hub as
+// its own error, never silently removed. No plaintext message log files
+// — the ledger on the hub is the record.
 class PollService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var loopJob: Job? = null
     private lateinit var config: BridgeConfig
-    private lateinit var listener: KakaoListener
 
     override fun onCreate() {
         super.onCreate()
@@ -38,7 +46,9 @@ class PollService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        scope.launch { loop() }
+        // START_STICKY and the settings screen both call this again; one
+        // poll loop per process, never a second one racing the queue.
+        if (loopJob?.isActive != true) loopJob = scope.launch { loop() }
         return START_STICKY
     }
 
@@ -75,12 +85,13 @@ class PollService : Service() {
         val items = HubClient.pollOutbox(baseUrl, config.lastAckTs)
         var maxTs = config.lastAckTs
         val seen = config.snapshotDelivered().toMutableSet()
+        val queued = readQueue().map { it.messageId }.toSet()
         for (item in items) {
             // App-side echo guard: never execute a messageId twice, even if
-            // the server ever serves it again. Matches the seen-restore
-            // pattern used for ingress ids.
-            if (Dedupe.shouldDeliver(seen, item.messageId)) {
-                deliver(item)
+            // the server ever serves it again — and never start a second
+            // attempt for one that is already waiting in the retry queue.
+            if (Dedupe.shouldDeliver(seen, item.messageId) && item.messageId !in queued) {
+                attempt(RetryJob(item.messageId, item.body, config.defaultRoom, tries = 0, nextTs = 0L), fromQueue = false)
                 seen.add(item.messageId)
             }
             if (item.ts > maxTs) maxTs = item.ts
@@ -89,56 +100,80 @@ class PollService : Service() {
         updateStatus(items.size)
     }
 
-    private suspend fun deliver(item: OutboxItem) {
-        val room = config.defaultRoom
+    // The single delivery path. Returns the step the job takes next, or
+    // null when it is settled (sent, dry-run, or reported as final).
+    private suspend fun attempt(job: RetryJob, fromQueue: Boolean): RetryStep? {
+        val room = job.room
         if (room.isEmpty()) {
-            HubClient.ack(config.coreBaseUrl, item.messageId, false, "no-default-room")
-            return
+            settle(job.messageId, ok = false, error = "no-default-room")
+            return null
         }
         // ③ Dry run: rehearse everything except the actual send. Recorded
-        // as its own verdict — never as delivered.
+        // as its own verdict — never as delivered. Checked on every
+        // attempt, so flipping the switch while a retry waits is honoured.
         if (config.dryRun) {
-            HubClient.ack(config.coreBaseUrl, item.messageId, true, mode = "dry-run")
-            config.markDelivered(item.messageId)
-            return
+            HubClient.ack(config.coreBaseUrl, job.messageId, true, mode = "dry-run")
+            config.markDelivered(job.messageId)
+            return null
         }
-        // ① Pacing first: quiet hours, daily cap, per-room cooldown + jitter.
+        // ① Pacing on every attempt: quiet hours, daily cap, per-room
+        // cooldown + jitter. A retry does not get to skip the queue.
         val now = System.currentTimeMillis()
         val calendar = java.util.Calendar.getInstance()
         val pace = config.paceCheck(
             room = room,
             nowMs = now,
             hour = calendar.get(java.util.Calendar.HOUR_OF_DAY),
-            day = "%04d-%02d-%02d".format(
-                calendar.get(java.util.Calendar.YEAR),
-                calendar.get(java.util.Calendar.MONTH) + 1,
-                calendar.get(java.util.Calendar.DAY_OF_MONTH),
-            ),
+            day = dayOf(calendar),
         )
         if (!pace.allowed) {
             if (pace.reason == "cooling-down") {
-                enqueueRetry(item, room, pace.reason, delayMs = pace.waitMs)
-            } else {
-                // quiet-hours / daily-cap: not retryable right now, record and drop.
-                HubClient.ack(config.coreBaseUrl, item.messageId, false, pace.reason)
-                config.markDelivered(item.messageId)
+                // Waiting is policy, not a failure: no try is consumed.
+                return schedule(RetryPlanner.afterCooldown(job, pace.waitMs, now), fromQueue)
             }
-            return
+            // quiet-hours / daily-cap: not retryable right now, record and drop.
+            settle(job.messageId, ok = false, error = pace.reason)
+            return null
         }
         // ② Ambiguity block: zero or several live notifications for one title.
         val found = ReplySender.findNotification(listener(), room)
         if (found == null) {
-            enqueueRetry(item, room, ReplySender.resolutionError(room) ?: "no-notification-for-room")
-            return
+            val error = ReplySender.resolutionError(room) ?: "no-notification-for-room"
+            return schedule(RetryPlanner.afterFailure(job, error, config.maxRetry, now), fromQueue)
         }
-        val result = ReplySender.reply(listener(), found.first, item.body)
-        if (result.ok) {
+        val result = ReplySender.reply(listener(), found.first, job.body)
+        return if (result.ok) {
+            // The reply action fired. That is what we know: the hub records
+            // it as delivered on the app's word, the notification API gives
+            // no receipt beyond this.
             config.recordSend(room, now, dayOf(calendar))
-            HubClient.ack(config.coreBaseUrl, item.messageId, true)
-            config.markDelivered(item.messageId)
+            settle(job.messageId, ok = true)
+            null
         } else {
-            enqueueRetry(item, room, result.error)
+            schedule(RetryPlanner.afterFailure(job, result.error, config.maxRetry, now), fromQueue)
         }
+    }
+
+    // Apply a planner step. A job coming from the queue is re-inserted by
+    // retryDue() (which owns the list for that pass); a fresh outbox item
+    // is enqueued here.
+    private suspend fun schedule(step: RetryStep, fromQueue: Boolean): RetryStep? {
+        when (step) {
+            is RetryStep.Exhausted -> {
+                settle(step.messageId, ok = false, error = "retry-exhausted")
+                return null
+            }
+            is RetryStep.Requeue -> {
+                if (!fromQueue) enqueue(step.job)
+                HubClient.ack(config.coreBaseUrl, step.job.messageId, false, step.error)
+                return step
+            }
+        }
+    }
+
+    private suspend fun settle(messageId: String, ok: Boolean, error: String = "") {
+        HubClient.ack(config.coreBaseUrl, messageId, ok, error)
+        config.markDelivered(messageId)
     }
 
     private fun dayOf(calendar: java.util.Calendar): String =
@@ -155,44 +190,21 @@ class PollService : Service() {
         if (due.isEmpty()) return
         for (job in due) {
             queue.remove(job)
-            if (job.tries >= config.maxRetry) {
-                HubClient.ack(config.coreBaseUrl, job.messageId, false, "retry-exhausted")
-                config.markDelivered(job.messageId)
-                continue
-            }
-            val found = ReplySender.findNotification(listener(), job.room)
-            if (found == null) {
-                requeue(queue, job, ReplySender.resolutionError(job.room) ?: "no-notification-for-room")
-                continue
-            }
-            val result = ReplySender.reply(listener(), found.first, job.body)
-            if (result.ok) {
-                HubClient.ack(config.coreBaseUrl, job.messageId, true)
-                config.markDelivered(job.messageId)
-            } else {
-                requeue(queue, job, result.error)
-            }
+            val step = attempt(job, fromQueue = true)
+            if (step is RetryStep.Requeue) queue.add(step.job)
         }
         writeQueue(queue)
     }
 
-    private fun requeue(queue: MutableList<RetryJob>, job: RetryJob, error: String) {
-        val tries = job.tries + 1
-        if (tries > config.maxRetry) {
-            scope.launch { HubClient.ack(config.coreBaseUrl, job.messageId, false, "retry-exhausted") }
-            config.markDelivered(job.messageId)
-            return
-        }
-        queue.add(job.copy(tries = tries, nextTs = System.currentTimeMillis() + tries * 60_000L))
-        scope.launch { HubClient.ack(config.coreBaseUrl, job.messageId, false, error) }
-    }
-
-    private suspend fun enqueueRetry(item: OutboxItem, room: String, error: String, delayMs: Long = 60_000L) {
+    private suspend fun enqueue(job: RetryJob) {
         val queue = readQueue().toMutableList()
-        queue.add(RetryJob(item.messageId, item.body, room, tries = 1, nextTs = System.currentTimeMillis() + delayMs))
-        while (queue.size > MAX_QUEUE) queue.removeAt(0)
+        queue.add(job)
+        // Overflow is a reported outcome, not a silent drop.
+        for (evicted in RetryPlanner.overflow(queue, MAX_QUEUE)) {
+            queue.remove(evicted)
+            settle(evicted.messageId, ok = false, error = "queue-overflow")
+        }
         writeQueue(queue)
-        HubClient.ack(config.coreBaseUrl, item.messageId, false, error)
     }
 
     private fun readQueue(): List<RetryJob> {
@@ -242,7 +254,13 @@ class PollService : Service() {
 
     private fun updateStatus(fetched: Int) {
         val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(STATUS_ID, statusNotification("last poll: $fetched item(s)"))
+        val waiting = readQueue()
+        val next = waiting.minOfOrNull { it.nextTs }
+        val queueNote = if (waiting.isEmpty()) "" else {
+            val inSecs = ((next ?: 0L) - System.currentTimeMillis()).coerceAtLeast(0L) / 1000
+            " · ${waiting.size} waiting, next in ${inSecs}s"
+        }
+        manager.notify(STATUS_ID, statusNotification("last poll: $fetched item(s)$queueNote"))
     }
 
     companion object {
