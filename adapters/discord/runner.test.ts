@@ -92,6 +92,50 @@ describe("discord runner", () => {
     assert.equal(ack?.error, "http-403");
   });
 
+  it("keeps the inbound cursor when the core rejects the post, re-posts next pass", async () => {
+    let coreUp = false;
+    const s = script({
+      "?limit=1": () => [{ id: "200", content: "old", author: { id: "u0" } }],
+      "?after=200": () => [{ id: "201", content: "hello", author: { id: "u1", username: "w" } }],
+      "/ingress": () => ({ targets: [] }),
+    });
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/ingress") && !coreUp) return new Response("{}", { status: 503 });
+      return s.fetch(input, init);
+    }) as typeof fetch;
+    const runner = new DiscordRunner(cfg);
+    await runner.inboundTick();
+    await assert.rejects(() => runner.inboundTick(), /http 503/);
+    coreUp = true;
+    assert.equal(await runner.inboundTick(), 1, "same message is posted once the core is back");
+    const afters = s.calls.filter((c) => c.url.includes("?after=")).map((c) => c.url.split("?after=")[1]);
+    assert.deepEqual(afters.map((a) => a?.split("&")[0]), ["200", "200"], "cursor did not move past the failed post");
+  });
+
+  it("defers an ack the core did not take and flushes it next pass — never re-sends", async () => {
+    let ackUp = false;
+    const s = script({
+      "/outbox?": () => ({ items: [{ messageId: "hub:d->discord", body: "x", lang: "ko", ts: 1 }] }),
+      "/channels/c/messages": () => ({ id: "d-9" }),
+      "/outbox/ack": () => ({ acked: true }),
+    });
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/outbox/ack") && !ackUp) return new Response("{}", { status: 503 });
+      return s.fetch(input, init);
+    }) as typeof fetch;
+    const runner = new DiscordRunner(cfg);
+    assert.equal(await runner.outboundTick(), 1);
+    assert.equal(runner.pendingAcks, 1);
+    ackUp = true;
+    assert.equal(await runner.outboundTick(), 0, "served again, not re-sent");
+    assert.equal(runner.pendingAcks, 0);
+    // The 503 attempt never reached the scripted core; the flush did.
+    const acks = s.calls.filter((c) => c.url.endsWith("/outbox/ack"));
+    assert.equal(acks.length, 1, "exactly one ack reached the core: the flushed one");
+    assert.equal(acks[0]?.body?.nativeId, "d-9");
+    assert.equal(s.calls.filter((c) => c.url.includes("/channels/c/messages") && c.body !== undefined).length, 1);
+  });
+
   it("starts the inbound cursor at now, then posts human messages only", async () => {
     let cursorSet = false;
     const s = script({

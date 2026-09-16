@@ -8,7 +8,7 @@ import {
   OpenAICompatibleProvider,
   PassthroughProvider,
 } from "./translate/index.ts";
-import { makeMessage, type SenderInfo } from "./schema.ts";
+import { makeMessage, type GatewayMessage, type RoutedMessage, type SenderInfo } from "./schema.ts";
 
 export interface ServerConfig {
   port: number;
@@ -255,6 +255,29 @@ export function rebuildPending(history: LedgerEntry[]): Map<string, Pending> {
   return out;
 }
 
+// Ids whose original was persisted but whose fan-out never happened: an
+// in|failed marker exists and no `id->channel` line does. A retry for
+// such an id resumes at translation.
+export function rebuildRetryable(history: LedgerEntry[]): Set<string> {
+  const failed = new Set<string>();
+  for (const e of history) if (e.direction === "in" && e.verdict === "failed") failed.add(e.messageId);
+  if (failed.size === 0) return failed;
+  for (const e of history) {
+    const arrow = e.messageId.lastIndexOf("->");
+    if (arrow > 0) failed.delete(e.messageId.slice(0, arrow));
+  }
+  return failed;
+}
+
+// Short, content-free error label for the ledger and the response.
+function errorCode(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const http = /http (\d{3})/.exec(message);
+  if (http) return `http-${http[1]}`;
+  if (/abort|timeout/i.test(message)) return "timeout";
+  return error instanceof Error ? error.name : "error";
+}
+
 // Thin HTTP wiring over the core pipeline. Adapter processes POST native
 // events here; the hub polls/reads state here. No secrets in code.
 export async function startServer(config: ServerConfig): Promise<void> {
@@ -369,6 +392,10 @@ export async function startServer(config: ServerConfig): Promise<void> {
   // ledger at startup (fresh in-lines only — marker lines excluded) so a
   // restart cannot re-execute history.
   const seenIngress = new Set<string>();
+  // Ingress ids being processed right now / whose fan-out must be redone
+  // (see runIngress for the state machine).
+  const inflight = new Set<string>();
+  const retryable = new Set<string>();
   try {
     const history = await ledger.readAll();
     for (const entry of history) {
@@ -383,6 +410,8 @@ export async function startServer(config: ServerConfig): Promise<void> {
       }
     }
     for (const [id, held] of rebuildPending(history)) pending.set(id, held);
+    for (const id of rebuildRetryable(history)) retryable.add(id);
+    if (retryable.size > 0) console.log(`index-messenger core: ${retryable.size} ingress id(s) await a retry`);
     if (pending.size > 0) console.log(`index-messenger core: ${pending.size} held send(s) restored from the ledger`);
   } catch {
     // Fresh ledger: nothing to rebuild.
@@ -398,6 +427,93 @@ export async function startServer(config: ServerConfig): Promise<void> {
       body: "",
       verdict: "duplicate",
     });
+  }
+
+  // Ingress state machine, one id at a time:
+  //   received   the original is in the ledger (in line) — from here on
+  //              the id is idempotent and survives a restart
+  //   processing translation + fan-out in flight (inflight set); a second
+  //              request for the same id gets 202, never a second run
+  //   done       fan-out lines written; further requests are duplicates
+  //   failed     translation or a write failed after the original was
+  //              persisted: an in|failed marker is written and the id is
+  //              retryable — the next request for it resumes at
+  //              translation without re-recording the original
+  async function runIngress(
+    msg: GatewayMessage,
+    sender: SenderInfo | undefined,
+    res: ServerResponse,
+    extra: Record<string, unknown>,
+  ): Promise<void> {
+    if (inflight.has(msg.id)) {
+      send(res, 202, { processing: true, messageId: msg.id });
+      return;
+    }
+    const resume = retryable.has(msg.id);
+    // Idempotency: nativeId is the key. A re-injected id executes
+    // nothing — only the duplicate receipt is logged.
+    if (seenIngress.has(msg.id) && !resume) {
+      await noteDuplicate(msg.origin, msg.id);
+      send(res, 200, { duplicate: true, messageId: msg.id });
+      return;
+    }
+    inflight.add(msg.id);
+    try {
+      if (!resume && router.isEcho(msg)) {
+        // Loop guard: this native id was created by one of our own
+        // executors. Receipt only — no body, no fan-out, no relay.
+        await ledger.append({
+          ts: Date.now(),
+          direction: "in",
+          channel: msg.origin,
+          messageId: msg.id,
+          lang: "",
+          body: "",
+          verdict: "echo",
+        });
+        seenIngress.add(msg.id);
+        send(res, 200, { dropped: "echo", messageId: msg.id });
+        return;
+      }
+      if (!resume) {
+        // Persist the original before any translation: from here the
+        // message cannot be lost to a provider outage or a restart.
+        await ledger.append({
+          ts: msg.ts,
+          direction: "in",
+          channel: msg.origin,
+          messageId: msg.id,
+          lang: msg.lang,
+          body: msg.body,
+          sender,
+        });
+        seenIngress.add(msg.id);
+      }
+      let routed: RoutedMessage;
+      try {
+        routed = await router.route(msg);
+      } catch (error) {
+        // Translation failed after the original was persisted. Mark it
+        // and keep the id retryable: the same request again resumes here.
+        retryable.add(msg.id);
+        await ledger.append({
+          ts: Date.now(),
+          direction: "in",
+          channel: msg.origin,
+          messageId: msg.id,
+          lang: "",
+          body: errorCode(error),
+          verdict: "failed",
+        });
+        send(res, 503, { error: "translation failed", code: errorCode(error), messageId: msg.id, retryable: true });
+        return;
+      }
+      const policies = await recordFanout(msg, sender, routed.targets);
+      retryable.delete(msg.id);
+      send(res, 200, { ...routed, ...extra, policies, ...(resume ? { resumed: true } : {}) });
+    } finally {
+      inflight.delete(msg.id);
+    }
   }
 
   const server = createServer(async (req, res) => {
@@ -441,54 +557,18 @@ export async function startServer(config: ServerConfig): Promise<void> {
       }
       // Ingress from any adapter: { origin, nativeId, lang, body, sender? }
       if (req.method === "POST" && req.url === "/ingress") {
-        const event = (await readJson(req)) as {
-          origin: string;
-          nativeId: string;
-          lang: string;
-          body: string;
-          sender?: unknown;
-        };
+        const event = ((await readJson(req)) ?? {}) as Record<string, unknown>;
+        if (typeof event.origin !== "string" || typeof event.nativeId !== "string" || typeof event.body !== "string") {
+          send(res, 400, { error: "origin, nativeId and body are required" });
+          return;
+        }
         const sender = asSender(event.sender);
         // Language is a property of the channel's user, not of the client:
         // bindings[origin] wins over the claimed lang (the kakao listener
         // hardcodes ko; an English-speaking room still reads as English).
-        const lang = router.getBindings()[event.origin] ?? event.lang;
+        const lang = router.getBindings()[event.origin] ?? (typeof event.lang === "string" ? event.lang : "");
         const msg = makeMessage(event.origin, event.nativeId, lang, event.body, Date.now(), sender);
-        // Idempotency: nativeId is the key. A re-injected id executes
-        // nothing — only the duplicate receipt is logged.
-        if (seenIngress.has(msg.id)) {
-          await noteDuplicate(msg.origin, msg.id);
-          send(res, 200, { duplicate: true, messageId: msg.id });
-          return;
-        }
-        seenIngress.add(msg.id);
-        if (router.isEcho(msg)) {
-          // Loop guard: this native id was created by one of our own
-          // executors. Receipt only — no body, no fan-out, no relay.
-          await ledger.append({
-            ts: Date.now(),
-            direction: "in",
-            channel: msg.origin,
-            messageId: msg.id,
-            lang: "",
-            body: "",
-            verdict: "echo",
-          });
-          send(res, 200, { dropped: "echo", messageId: msg.id });
-          return;
-        }
-        const routed = await router.route(msg);
-        await ledger.append({
-          ts: msg.ts,
-          direction: "in",
-          channel: msg.origin,
-          messageId: msg.id,
-          lang: msg.lang,
-          body: msg.body,
-          sender,
-        });
-        const policies = await recordFanout(msg, sender, routed.targets);
-        send(res, 200, { ...routed, policies });
+        await runIngress(msg, sender, res, {});
         return;
       }
       // Cowork ingress: same pipeline, but the origin is server-tagged.
@@ -507,36 +587,19 @@ export async function startServer(config: ServerConfig): Promise<void> {
           return;
         }
         const sender = asSender(raw.sender);
-        const msg = makeMessage("cowork", raw.nativeId, raw.lang, raw.body, Date.now(), sender);
+        const msg = makeMessage(COWORK, raw.nativeId, raw.lang, raw.body, Date.now(), sender);
         if (stripped.length > 0) {
           await ledger.append({
             ts: Date.now(),
             direction: "in",
-            channel: "cowork",
+            channel: COWORK,
             messageId: msg.id,
             lang: "",
             body: `stripped: ${stripped.join(",")}`,
             verdict: "stripped",
           });
         }
-        if (seenIngress.has(msg.id)) {
-          await noteDuplicate("cowork", msg.id);
-          send(res, 200, { duplicate: true, messageId: msg.id });
-          return;
-        }
-        seenIngress.add(msg.id);
-        const routed = await router.route(msg);
-        await ledger.append({
-          ts: msg.ts,
-          direction: "in",
-          channel: msg.origin,
-          messageId: msg.id,
-          lang: msg.lang,
-          body: msg.body,
-          sender,
-        });
-        const policies = await recordFanout(msg, sender, routed.targets);
-        send(res, 200, { ...routed, stripped, policies });
+        await runIngress(msg, sender, res, { stripped });
         return;
       }
       // Hub outbound: { body, lang }. One path for every hub sentence:

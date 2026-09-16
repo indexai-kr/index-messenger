@@ -92,6 +92,10 @@ export class DiscordRunner {
   private day = "";
   private sentToday = 0;
   private lastInboundId: string | undefined;
+  // Acks the core did not take (network blip after a successful send).
+  // Flushed at the start of every outbound pass so a delivered message is
+  // never silently left verdict-less — and never re-sent to find out.
+  private unacked: Array<{ messageId: string; ok: boolean; error: string; nativeId?: string }> = [];
 
   // No parameter properties: Node's strip-only TypeScript mode rejects them.
   constructor(cfg: RunnerConfig) {
@@ -116,7 +120,23 @@ export class DiscordRunner {
   }
 
   private async ack(messageId: string, ok: boolean, error = "", nativeId?: string): Promise<void> {
-    await this.postCore("/outbox/ack", { messageId, channel: "discord", ok, error, nativeId });
+    try {
+      await this.postCore("/outbox/ack", { messageId, channel: "discord", ok, error, nativeId });
+    } catch (e) {
+      this.unacked.push({ messageId, ok, error, nativeId });
+      log(`ack deferred ${messageId} ${errorCode(e)}`);
+    }
+  }
+
+  private async flushAcks(): Promise<void> {
+    const queue = this.unacked;
+    this.unacked = [];
+    for (const a of queue) await this.ack(a.messageId, a.ok, a.error, a.nativeId);
+  }
+
+  /** Acks still owed to the core (visible for tests and status). */
+  get pendingAcks(): number {
+    return this.unacked.length;
   }
 
   private remember(messageId: string): boolean {
@@ -136,6 +156,7 @@ export class DiscordRunner {
 
   /** One outbound pass. Returns the number of messages actually sent. */
   async outboundTick(): Promise<number> {
+    await this.flushAcks();
     const res = await fetch(`${this.cfg.core}/outbox?channel=discord&since=${this.sinceTs}`, {
       headers: this.coreHeaders(),
     });
@@ -199,10 +220,16 @@ export class DiscordRunner {
     batch.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
     let posted = 0;
     for (const message of batch) {
-      this.lastInboundId = message.id;
       const payload = toIngress(message);
-      if (payload === null) continue;
+      if (payload === null) {
+        this.lastInboundId = message.id;
+        continue;
+      }
+      // The cursor moves only once the core has taken the message. A
+      // failed post leaves it where it is and the next pass re-reads from
+      // there, so an outage delays delivery instead of skipping it.
       const result = await this.postCore("/ingress", payload);
+      this.lastInboundId = message.id;
       posted += 1;
       const outcome =
         typeof result.dropped === "string" ? result.dropped : result.duplicate === true ? "duplicate" : "routed";
