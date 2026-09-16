@@ -48,9 +48,9 @@ describe("discord runner", () => {
     const s = script({
       "/outbox?": () => ({
         items: [
-          { messageId: "kakao:a->discord", body: "x", lang: "ko", ts: 1, origin: "relay" },
-          { messageId: "hub:b->discord", body: "y", lang: "ko", ts: 2, origin: "hub" },
-          { messageId: "hub:c->discord", body: "z", lang: "ko", ts: 3, origin: "hub" },
+          { seq: 1, messageId: "kakao:a->discord", body: "x", lang: "ko", ts: 1, origin: "relay" },
+          { seq: 2, messageId: "hub:b->discord", body: "y", lang: "ko", ts: 2, origin: "hub" },
+          { seq: 3, messageId: "hub:c->discord", body: "z", lang: "ko", ts: 3, origin: "hub" },
         ],
       }),
       "/channels/c/messages": () => ({ id: `d-${++created}` }),
@@ -77,7 +77,7 @@ describe("discord runner", () => {
 
   it("reports a failed send with an error code, never throws out of the tick", async () => {
     const s = script({
-      "/outbox?": () => ({ items: [{ messageId: "hub:f->discord", body: "x", lang: "ko", ts: 1 }] }),
+      "/outbox?": () => ({ items: [{ seq: 1, messageId: "hub:f->discord", body: "x", lang: "ko", ts: 1 }] }),
       "/outbox/ack": () => ({ acked: true }),
     });
     const failing = s.fetch;
@@ -115,7 +115,7 @@ describe("discord runner", () => {
   it("defers an ack the core did not take and flushes it next pass — never re-sends", async () => {
     let ackUp = false;
     const s = script({
-      "/outbox?": () => ({ items: [{ messageId: "hub:d->discord", body: "x", lang: "ko", ts: 1 }] }),
+      "/outbox?": () => ({ items: [{ seq: 1, messageId: "hub:d->discord", body: "x", lang: "ko", ts: 1 }] }),
       "/channels/c/messages": () => ({ id: "d-9" }),
       "/outbox/ack": () => ({ acked: true }),
     });
@@ -134,6 +134,30 @@ describe("discord runner", () => {
     assert.equal(acks.length, 1, "exactly one ack reached the core: the flushed one");
     assert.equal(acks[0]?.body?.nativeId, "d-9");
     assert.equal(s.calls.filter((c) => c.url.includes("/channels/c/messages") && c.body !== undefined).length, 1);
+  });
+
+  it("without backfill, the first pass sets the cursor at the core's latest seq and sends nothing", async () => {
+    let served = 0;
+    const s = script({
+      "/outbox?": (call) => {
+        served += 1;
+        const after = Number(call.url.split("after=")[1]);
+        const all = [
+          { seq: 5, messageId: "old:1->discord", body: "x", lang: "ko", ts: 1 },
+          { seq: 9, messageId: "new:2->discord", body: "y", lang: "ko", ts: 2 },
+        ];
+        return { items: all.filter((i) => i.seq > after), latest: served === 1 ? 7 : 9 };
+      },
+      "/channels/c/messages": () => ({ id: "d-1" }),
+      "/outbox/ack": () => ({ acked: true }),
+    });
+    globalThis.fetch = s.fetch;
+    const runner = new DiscordRunner({ ...cfg, backfill: false });
+    assert.equal(await runner.outboundTick(), 0, "first pass only positions the cursor");
+    assert.equal(await runner.outboundTick(), 1, "only the line appended after the cursor is sent");
+    const sends = s.calls.filter((c) => c.url.includes("/channels/c/messages") && c.body !== undefined);
+    assert.equal(sends.length, 1);
+    assert.equal(s.calls.find((c) => c.url.endsWith("/outbox/ack"))?.body?.messageId, "new:2->discord");
   });
 
   it("starts the inbound cursor at now, then posts human messages only", async () => {

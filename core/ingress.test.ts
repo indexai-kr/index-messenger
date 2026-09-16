@@ -136,16 +136,15 @@ describe("cowork trust boundary", () => {
     const before = await get(since);
     const item = before.items.find((i) => i.messageId === "hub:echo-guard-1->telegram");
     assert.ok(item, "fresh send item must be listed");
-    // Deliver it, then consume it: result lines must never re-enter the
-    // queue. (The original verdict-less line remains addressable by the
-    // since-cursor; the app dedupe drops replays — see DedupeTest.)
-    await post("/outbox/ack", { messageId: item.messageId, channel: "telegram", ok: true });
+    // A read receipt does not decide the send: still served.
     await post("/outbox/seen", { messageId: item.messageId, channel: "telegram", consumer: "t" });
+    assert.deepEqual((await get(since)).items.map((i) => i.messageId), [item.messageId], "seen is not a result");
+    // Deliver it: the send is decided and disappears from the queue, and
+    // the ack line itself is never served as a send item.
+    await post("/outbox/ack", { messageId: item.messageId, channel: "telegram", ok: true });
     const after = await get(since);
-    assert.deepEqual(
-      after.items.map((i) => i.messageId),
-      [item.messageId],
-      "only the fresh send line may be listed — no result lines",
-    );
+    assert.deepEqual(after.items, [], "delivered send is folded out of the queue");
+    const fromZero = await get(0);
+    assert.ok(!fromZero.items.some((i) => i.messageId === item.messageId), "folded regardless of cursor");
   });
 });

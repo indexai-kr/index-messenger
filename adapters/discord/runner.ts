@@ -71,6 +71,7 @@ export function configFromEnv(): RunnerConfig {
 }
 
 interface OutboxItem {
+  seq: number;
   messageId: string;
   body: string;
   lang: string;
@@ -86,7 +87,9 @@ const MAX_SEEN = 1000;
 
 export class DiscordRunner {
   private readonly cfg: RunnerConfig;
-  private sinceTs: number;
+  // Ledger sequence cursor: -1 until the first pass sets it (to 0 for a
+  // backfill, to the core's `latest` otherwise — start at now).
+  private afterSeq: number;
   private seen: string[] = [];
   private lastSendTs = 0;
   private day = "";
@@ -100,7 +103,7 @@ export class DiscordRunner {
   // No parameter properties: Node's strip-only TypeScript mode rejects them.
   constructor(cfg: RunnerConfig) {
     this.cfg = cfg;
-    this.sinceTs = cfg.backfill ? 0 : Date.now();
+    this.afterSeq = cfg.backfill ? 0 : -1;
   }
 
   private coreHeaders(): Record<string, string> {
@@ -157,15 +160,22 @@ export class DiscordRunner {
   /** One outbound pass. Returns the number of messages actually sent. */
   async outboundTick(): Promise<number> {
     await this.flushAcks();
-    const res = await fetch(`${this.cfg.core}/outbox?channel=discord&since=${this.sinceTs}`, {
+    const res = await fetch(`${this.cfg.core}/outbox?channel=discord&after=${Math.max(0, this.afterSeq)}`, {
       headers: this.coreHeaders(),
     });
     if (!res.ok) throw new Error(`core /outbox http ${res.status}`);
-    const { items } = (await res.json()) as { items: OutboxItem[] };
-    items.sort((a, b) => a.ts - b.ts);
+    const { items, latest } = (await res.json()) as { items: OutboxItem[]; latest?: number };
+    if (this.afterSeq < 0) {
+      // First pass without backfill: whatever is undecided now predates
+      // this process and is not ours to fire. Start at the top.
+      this.afterSeq = typeof latest === "number" ? latest : 0;
+      log(`outbox cursor set at seq ${this.afterSeq}`);
+      return 0;
+    }
+    items.sort((a, b) => a.seq - b.seq);
     let sent = 0;
     for (const item of items) {
-      if (item.ts > this.sinceTs) this.sinceTs = item.ts;
+      if (item.seq > this.afterSeq) this.afterSeq = item.seq;
       // Never execute a messageId twice, even if the server serves it again.
       if (!this.remember(item.messageId)) continue;
       this.rollDay();

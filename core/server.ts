@@ -255,6 +255,40 @@ export function rebuildPending(history: LedgerEntry[]): Map<string, Pending> {
   return out;
 }
 
+// Result verdicts an executor reports for a send. A send line with any
+// of these later on the same (channel, messageId) is decided.
+const RESULT_VERDICTS = new Set(["delivered", "failed", "dry-run"]);
+
+export interface OutboxLine {
+  seq: number;
+  messageId: string;
+  body: string;
+  lang: string;
+  ts: number;
+  origin?: string;
+}
+
+// Undecided send lines for one channel, oldest first, one per messageId
+// (a re-run confirm may append the same send twice; the executor gets it
+// once).
+export function pendingOutbox(history: LedgerEntry[], channel: string): OutboxLine[] {
+  const decided = new Set<string>();
+  for (const e of history) {
+    if (e.direction === "out" && e.channel === channel && e.verdict !== undefined && RESULT_VERDICTS.has(e.verdict)) {
+      decided.add(e.messageId);
+    }
+  }
+  const out: OutboxLine[] = [];
+  const listed = new Set<string>();
+  history.forEach((e, i) => {
+    if (e.direction !== "out" || e.channel !== channel || e.verdict !== undefined) return;
+    if (decided.has(e.messageId) || listed.has(e.messageId)) return;
+    listed.add(e.messageId);
+    out.push({ seq: i + 1, messageId: e.messageId, body: e.body, lang: e.lang, ts: e.ts, origin: e.origin });
+  });
+  return out;
+}
+
 // Ids whose original was persisted but whose fan-out never happened: an
 // in|failed marker exists and no `id->channel` line does. A retry for
 // such an id resumes at translation.
@@ -547,8 +581,22 @@ export async function startServer(config: ServerConfig): Promise<void> {
         send(res, 200, router.getBindings());
         return;
       }
-      if (req.method === "GET" && req.url === "/ledger") {
+      // Ledger read. `?after=<seq>` returns only lines appended after
+      // that sequence number (1-based file position) — the incremental
+      // cursor a screen can poll with instead of re-reading everything.
+      // `?limit=` caps the page. Without `after` the full sorted ledger is
+      // returned as before.
+      if (req.method === "GET" && typeof req.url === "string" && (req.url === "/ledger" || req.url.startsWith("/ledger?"))) {
+        const query = new URL(req.url, "http://localhost");
         const all = await ledger.readAll();
+        const latest = all.length;
+        if (query.searchParams.has("after")) {
+          const after = Math.max(0, Number(query.searchParams.get("after")) || 0);
+          const limit = Math.max(1, Math.min(5000, Number(query.searchParams.get("limit")) || 500));
+          const page = all.slice(after, after + limit).map((e, i) => ({ ...e, seq: after + i + 1 }));
+          send(res, 200, { items: page, latest, more: after + page.length < latest });
+          return;
+        }
         // Logical-order reads: write order scrambles under parallel
         // fan-out, so integrity lives in sorted reads, not file order.
         all.sort((a, b) => a.ts - b.ts || (a.messageId < b.messageId ? -1 : a.messageId > b.messageId ? 1 : 0));
@@ -796,15 +844,26 @@ export async function startServer(config: ServerConfig): Promise<void> {
       // and record-only derived copies carry a verdict and are NEVER
       // emitted as send items — otherwise acks loop back into sends
       // (outbox echo) or inbound traffic auto-forwards. No new store.
-      if (req.method === "GET" && typeof req.url === "string" && req.url.startsWith("/outbox")) {
+      // Outbox queue for poll-based executors. Only undecided sends are
+      // served: a send line is folded with every later result line for
+      // the same (channel, messageId) — delivered, failed, dry-run — and
+      // dropped once one exists. "seen" is a read receipt, not a result,
+      // and does not fold. Cursor: `after=<seq>` (1-based ledger position,
+      // exact even when two lines share a millisecond) or the legacy
+      // `since=<ts>`. The response carries `latest`, the current top seq,
+      // so a fresh executor can start "at now" without replaying history.
+      if (req.method === "GET" && typeof req.url === "string" && req.url.startsWith("/outbox?")) {
         const query = new URL(req.url, "http://localhost");
         const channel = query.searchParams.get("channel") ?? "";
         const since = Number(query.searchParams.get("since") ?? "0");
+        const afterParam = query.searchParams.get("after");
+        const after = afterParam === null ? -1 : Math.max(0, Number(afterParam) || 0);
         const all = await ledger.readAll();
-        const items = all
-          .filter((e) => e.direction === "out" && e.channel === channel && e.verdict === undefined && e.ts > since)
-          .map((e) => ({ messageId: e.messageId, body: e.body, lang: e.lang, ts: e.ts, origin: e.origin }));
-        send(res, 200, { items });
+        const latest = all.length;
+        const items = pendingOutbox(all, channel)
+          .filter((item) => (after >= 0 ? item.seq > after : item.ts > since))
+          .map(({ seq, messageId, body, lang, ts, origin }) => ({ seq, messageId, body, lang, ts, origin }));
+        send(res, 200, { items, latest });
         return;
       }
       if (req.method === "POST" && req.url === "/outbox/ack") {
