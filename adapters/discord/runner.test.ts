@@ -30,6 +30,7 @@ const cfg: RunnerConfig = {
   botToken: "t",
   channelId: "c",
   core: "http://core",
+  coreToken: "",
   pollSecs: 1,
   minGapSecs: 1,
   dailyCap: 2,

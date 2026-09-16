@@ -46,6 +46,8 @@ export interface RunnerConfig {
   botToken: string;
   channelId: string;
   core: string;
+  /** Core bearer token (CORE_AUTH_TOKEN). Empty when the core runs open on loopback. */
+  coreToken: string;
   pollSecs: number;
   minGapSecs: number;
   dailyCap: number;
@@ -58,6 +60,7 @@ export function configFromEnv(): RunnerConfig {
     botToken: env("DISCORD_BOT_TOKEN"),
     channelId: env("DISCORD_CHANNEL_ID"),
     core: env("CORE_BASE_URL", "http://localhost:8787").replace(/\/+$/, ""),
+    coreToken: env("CORE_AUTH_TOKEN", ""),
     pollSecs: num("DISCORD_POLL_SECS", 3, 1, 60),
     // Floors: never faster than one send per second, never more than
     // 2000 a day. Settings can slow it down, not remove the limits.
@@ -96,10 +99,16 @@ export class DiscordRunner {
     this.sinceTs = cfg.backfill ? 0 : Date.now();
   }
 
+  private coreHeaders(): Record<string, string> {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (this.cfg.coreToken !== "") headers.authorization = `Bearer ${this.cfg.coreToken}`;
+    return headers;
+  }
+
   private async postCore(path: string, body: unknown): Promise<Record<string, unknown>> {
     const res = await fetch(`${this.cfg.core}${path}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: this.coreHeaders(),
       body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error(`core ${path} http ${res.status}`);
@@ -127,7 +136,9 @@ export class DiscordRunner {
 
   /** One outbound pass. Returns the number of messages actually sent. */
   async outboundTick(): Promise<number> {
-    const res = await fetch(`${this.cfg.core}/outbox?channel=discord&since=${this.sinceTs}`);
+    const res = await fetch(`${this.cfg.core}/outbox?channel=discord&since=${this.sinceTs}`, {
+      headers: this.coreHeaders(),
+    });
     if (!res.ok) throw new Error(`core /outbox http ${res.status}`);
     const { items } = (await res.json()) as { items: OutboxItem[] };
     items.sort((a, b) => a.ts - b.ts);

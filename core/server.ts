@@ -12,6 +12,18 @@ import { makeMessage, type SenderInfo } from "./schema.ts";
 
 export interface ServerConfig {
   port: number;
+  /**
+   * Listen address. Defaults to loopback: the core is reachable from
+   * this machine only unless an operator opens it on purpose. A
+   * non-loopback host requires `authToken`.
+   */
+  host?: string;
+  /**
+   * Shared bearer token. When set, every endpoint except /health requires
+   * `authorization: Bearer <token>`. Executors, the hub proxy and the
+   * phone app carry it; the browser never sees it (the Vite proxy adds it).
+   */
+  authToken?: string;
   bindingsPath: string;
   ledgerPath: string;
   hubOrigin: string;
@@ -63,10 +75,39 @@ function env(name: string, fallback = ""): string {
   return process.env[name] ?? fallback;
 }
 
+// Request bodies are small JSON documents. Anything bigger is rejected
+// before parsing so a client cannot exhaust memory through the ledger.
+const MAX_BODY_BYTES = 64 * 1024;
+
+class BodyTooLarge extends Error {
+  constructor() {
+    super(`request body exceeds ${MAX_BODY_BYTES} bytes`);
+    this.name = "BodyTooLarge";
+  }
+}
+
 async function readJson(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk as Buffer);
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > MAX_BODY_BYTES) throw new BodyTooLarge();
+    chunks.push(chunk as Buffer);
+  }
   return JSON.parse(Buffer.concat(chunks).toString("utf8") as string);
+}
+
+const LOOPBACK = new Set(["127.0.0.1", "::1", "localhost"]);
+
+export function isLoopback(host: string): boolean {
+  return LOOPBACK.has(host);
+}
+
+function bearerOf(req: IncomingMessage): string | undefined {
+  const header = req.headers.authorization;
+  if (typeof header !== "string") return undefined;
+  const m = /^Bearer\s+(.+)$/i.exec(header.trim());
+  return m?.[1];
 }
 
 function send(res: ServerResponse, status: number, body: unknown): void {
@@ -102,6 +143,13 @@ const TRUST_FIELDS = [
 // Thin HTTP wiring over the core pipeline. Adapter processes POST native
 // events here; the hub polls/reads state here. No secrets in code.
 export async function startServer(config: ServerConfig): Promise<void> {
+  const host = config.host ?? "127.0.0.1";
+  const authToken = config.authToken ?? "";
+  if (!isLoopback(host) && authToken === "") {
+    throw new Error(
+      `refusing to listen on ${host} without CORE_AUTH_TOKEN: a non-loopback core must authenticate its callers`,
+    );
+  }
   const bindingsRaw = await readFile(config.bindingsPath, "utf8");
   const bindings = JSON.parse(bindingsRaw) as BindingTable;
   const ledger = new Ledger(config.ledgerPath);
@@ -220,7 +268,7 @@ export async function startServer(config: ServerConfig): Promise<void> {
   const server = createServer(async (req, res) => {
     res.setHeader("access-control-allow-origin", config.hubOrigin);
     res.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
-    res.setHeader("access-control-allow-headers", "content-type");
+    res.setHeader("access-control-allow-headers", "content-type, authorization");
     if (req.method === "OPTIONS") {
       res.writeHead(204);
       res.end();
@@ -229,7 +277,13 @@ export async function startServer(config: ServerConfig): Promise<void> {
 
     try {
       if (req.method === "GET" && req.url === "/health") {
-        send(res, 200, { ok: true });
+        send(res, 200, { ok: true, auth: authToken !== "" });
+        return;
+      }
+      // Everything past /health is state: reads of the ledger, sends,
+      // approvals, bindings. With a token configured, all of it is gated.
+      if (authToken !== "" && bearerOf(req) !== authToken) {
+        send(res, 401, { error: "unauthorized" });
         return;
       }
       if (req.method === "GET" && req.url === "/bindings") {
@@ -591,21 +645,29 @@ export async function startServer(config: ServerConfig): Promise<void> {
       }
       send(res, 404, { error: "not found" });
     } catch (error) {
+      if (error instanceof BodyTooLarge) {
+        send(res, 413, { error: error.message });
+        return;
+      }
       send(res, 500, { error: (error as Error).message });
     }
   });
 
-  server.listen(config.port, () => {
-    // Operator-visible policy state: which corridors are open. Pairs only,
-    // no message data.
+  server.listen(config.port, host, () => {
+    // Operator-visible policy state: which corridors are open, whether
+    // callers must authenticate. Pairs only, no message data, no token.
     const corridors = relay.map((p) => `${p.from}->${p.to}`).join(",") || "none";
-    console.log(`index-messenger core listening on :${config.port} (relay: ${corridors})`);
+    console.log(
+      `index-messenger core listening on ${host}:${config.port} (relay: ${corridors}, auth: ${authToken !== "" ? "token" : "none"})`,
+    );
   });
 }
 
 if (process.argv[1]?.endsWith("server.ts")) {
   await startServer({
     port: Number(env("PORT", "8787")),
+    host: env("HOST", "127.0.0.1"),
+    authToken: env("CORE_AUTH_TOKEN", ""),
     bindingsPath: env("BINDINGS_PATH", "./bindings.example.json"),
     ledgerPath: env("LEDGER_PATH", "./data/ledger.jsonl"),
     hubOrigin: env("HUB_ORIGIN", "http://localhost:5173"),

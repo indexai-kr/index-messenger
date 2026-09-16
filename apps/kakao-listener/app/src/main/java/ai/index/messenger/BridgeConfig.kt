@@ -10,11 +10,26 @@ class BridgeConfig(context: Context) {
     private val prefs: SharedPreferences =
         context.getSharedPreferences("index_messenger", Context.MODE_PRIVATE)
 
+    init {
+        // Both the listener and the poll service build a config first, so
+        // the HTTP layer always carries the stored token.
+        Net.authToken = prefs.getString(KEY_AUTH_TOKEN, "") ?: ""
+    }
+
     // Documentation address only (TEST-NET-1). The user overwrites it
     // with their own hub address on first launch.
     var coreBaseUrl: String
         get() = prefs.getString(KEY_BASE_URL, "http://192.0.2.1:8787") ?: ""
         set(v) = prefs.edit().putString(KEY_BASE_URL, v.trimEnd('/')).apply()
+
+    // Bearer token the hub expects (CORE_AUTH_TOKEN). Stored in app-private
+    // prefs like the address; never logged.
+    var coreAuthToken: String
+        get() = prefs.getString(KEY_AUTH_TOKEN, "") ?: ""
+        set(v) {
+            prefs.edit().putString(KEY_AUTH_TOKEN, v.trim()).apply()
+            Net.authToken = v.trim()
+        }
 
     var pollSecs: Int
         get() = prefs.getInt(KEY_POLL_SECS, 3).coerceIn(1, 60)
@@ -117,6 +132,7 @@ class BridgeConfig(context: Context) {
 
     companion object {
         private const val KEY_BASE_URL = "core_base_url"
+        private const val KEY_AUTH_TOKEN = "core_auth_token"
         private const val KEY_POLL_SECS = "poll_secs"
         private const val KEY_MAX_RETRY = "max_retry"
         private const val KEY_ROOM = "default_room"

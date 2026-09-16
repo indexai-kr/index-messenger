@@ -11,6 +11,15 @@ import java.net.URL
 // so the app has no network dependency beyond the platform itself.
 // Message bodies are sent to the hub only; they are never logged.
 object Net {
+    // Shared core token (CORE_AUTH_TOKEN on the hub). Empty = the core
+    // runs open on loopback and expects no header. Never logged.
+    @Volatile var authToken: String = ""
+
+    private fun HttpURLConnection.withAuth(): HttpURLConnection {
+        if (authToken.isNotEmpty()) setRequestProperty("Authorization", "Bearer $authToken")
+        return this
+    }
+
     suspend fun postJson(url: String, body: JSONObject, timeoutMs: Int = 10_000): Int =
         withContext(Dispatchers.IO) {
             val conn = (URL(url).openConnection() as HttpURLConnection).apply {
@@ -19,7 +28,7 @@ object Net {
                 readTimeout = timeoutMs
                 doOutput = true
                 setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            }
+            }.withAuth()
             try {
                 conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
                 conn.responseCode
@@ -33,7 +42,7 @@ object Net {
             val conn = (URL(url).openConnection() as HttpURLConnection).apply {
                 connectTimeout = timeoutMs
                 readTimeout = timeoutMs
-            }
+            }.withAuth()
             try {
                 conn.inputStream.use { it.readBytes().toString(Charsets.UTF_8) }
             } finally {

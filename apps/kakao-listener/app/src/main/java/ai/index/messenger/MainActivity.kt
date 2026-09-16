@@ -22,6 +22,7 @@ class MainActivity : AppCompatActivity() {
         config = BridgeConfig(this)
 
         val baseUrl = findViewById<EditText>(R.id.baseUrl)
+        val authToken = findViewById<EditText>(R.id.authToken)
         val pollSecs = findViewById<EditText>(R.id.pollSecs)
         val maxRetry = findViewById<EditText>(R.id.maxRetry)
         val defaultRoom = findViewById<EditText>(R.id.defaultRoom)
@@ -35,6 +36,7 @@ class MainActivity : AppCompatActivity() {
         val allowBackfill = findViewById<CheckBox>(R.id.allowBackfill)
 
         baseUrl.setText(config.coreBaseUrl)
+        authToken.setText(config.coreAuthToken)
         pollSecs.setText(config.pollSecs.toString())
         maxRetry.setText(config.maxRetry.toString())
         defaultRoom.setText(config.defaultRoom)
@@ -49,6 +51,7 @@ class MainActivity : AppCompatActivity() {
 
         findViewById<Button>(R.id.save).setOnClickListener {
             config.coreBaseUrl = baseUrl.text.toString()
+            config.coreAuthToken = authToken.text.toString()
             config.pollSecs = pollSecs.text.toString().toIntOrNull() ?: 3
             config.maxRetry = maxRetry.text.toString().toIntOrNull() ?: 5
             config.defaultRoom = defaultRoom.text.toString()
