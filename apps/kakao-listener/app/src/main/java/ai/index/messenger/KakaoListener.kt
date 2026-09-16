@@ -31,6 +31,31 @@ class KakaoListener : NotificationListenerService() {
         ListenerHandle.set(this)
     }
 
+    // The room index is in-memory. After a restart the bound room's
+    // notification may already be on the shade, and no new post will
+    // come for it until the other side writes again — so a reply would
+    // fail with no-notification-for-room until then (P3 live run,
+    // 2026-09-17 07:44). Seed the index from what is already posted.
+    override fun onListenerConnected() {
+        super.onListenerConnected()
+        val bound = config.defaultRoom
+        if (bound.isEmpty()) return
+        val active = try {
+            activeNotifications ?: emptyArray()
+        } catch (_: SecurityException) {
+            emptyArray()
+        }
+        var seeded = 0
+        for (sbn in active) {
+            if (sbn.packageName != KAKAO_PACKAGE) continue
+            val room = roomOf(sbn.notification.extras ?: continue) ?: continue
+            if (room != bound) continue
+            RoomIndex.put(room, sbn.key)
+            seeded += 1
+        }
+        Log.i(TAG, "listener connected, room index seeded from $seeded active notification(s)")
+    }
+
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         if (sbn.packageName != KAKAO_PACKAGE) return
         val extras = sbn.notification.extras ?: return
