@@ -55,16 +55,36 @@ The whitelist opens a named corridor, not the building. Nothing is ever
 auto-forwarded because two channels happen to be bound; every open pair
 is an explicit line in a file the operator wrote.
 
-Relay copies bypass nothing:
+No sendable copy bypasses anything — relay, hub or cowork origin alike:
 
-- **Gate.** Risk patterns in the source or in the translated text write
-  `gate|hold` and park the copy; `POST /confirm {id}` releases it as the
-  same sendable line it would otherwise have been. Nothing leaves before.
+- **Gate.** Risk patterns in the source or in the translated text, or a
+  structural token (number, bracket tag) the translation lost or
+  invented, write `gate|hold` and park the copy; `POST /confirm {id}`
+  releases it as the same sendable line it would otherwise have been.
+  Confirmation is by id: the held text is what goes out, a body in the
+  request is refused. Held copies are rebuilt from the ledger on
+  restart. The hub display copy is never executed and is not held.
 - **Pacing.** Executors keep their edge limits (kakao: same-room interval,
   quiet hours, daily cap; discord: min gap, daily cap) regardless of
   origin.
 - **Ledger.** Source and translation are recorded together, plus the
   policy decision and, on delivery, the platform-assigned native id.
+
+Access: the core listens on loopback by default. Opening it to the LAN
+(`HOST=0.0.0.0`, needed for the phone) requires `CORE_AUTH_TOKEN`; with
+a token set every endpoint but `/health` needs `Authorization: Bearer`.
+Executors and the phone app carry the token; the hub's dev proxy
+attaches it so the browser never holds it.
+
+Ingress durability: the original inbound line is written before any
+translation. A provider failure leaves an `in|failed` marker and the id
+retryable; the next request for the same id resumes at translation. A
+concurrent request for an id in flight is answered 202, never run twice.
+
+Outbox: `GET /outbox` serves undecided sends only — a send is folded out
+once any result ack (delivered / failed / dry-run) exists for it. The
+`after=<seq>` cursor is the 1-based ledger position, exact under
+same-millisecond writes.
 
 Loop guard: an executor acks a delivered send with the `nativeId` the
 platform assigned. The core remembers `<channel>:<nativeId>` (rebuilt

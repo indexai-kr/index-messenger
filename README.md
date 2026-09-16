@@ -188,6 +188,12 @@ npm run dev --workspace @index-messenger/hub
 Default bindings (`core/bindings.example.json`): hub → ko, telegram → ja,
 discord → en. See `docs/architecture.md` and `docs/adapters.md`.
 
+The core listens on `127.0.0.1` only. To reach it from a phone or another
+machine set `HOST=0.0.0.0` **and** `CORE_AUTH_TOKEN=<random>`; it refuses to
+start open without a token. Give the same token to the discord runner
+(`.env`), the hub dev server (`CORE_AUTH_TOKEN` in its environment; the
+proxy attaches it) and the kakao app's "hub token" field.
+
 ## Acceptance tracking
 
 - P1: hub Korean → telegram Japanese + discord English (screenshot), replies

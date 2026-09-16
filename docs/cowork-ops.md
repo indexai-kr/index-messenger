@@ -26,44 +26,70 @@ curl -X POST "$CORE/cowork/ingress" -H 'content-type: application/json' \
   -d '{"nativeId":"cowork-001","lang":"ko","body":"…"}'
 ```
 
-## Read deliveries: `GET /outbox?channel&since`
+## Read deliveries: `GET /outbox?channel&after` (or `&since`)
 
 ```sh
-curl "$CORE/outbox?channel=kakao&since=0"
-# {"items":[{"messageId":"hub:…->kakao","body":"…","lang":"ko","ts":…}]}
+curl "$CORE/outbox?channel=kakao&after=0"
+# {"items":[{"seq":42,"messageId":"hub:…->kakao","body":"…","lang":"ko","ts":…}],"latest":57}
 ```
 
-Poll with the last seen `ts` as `since`. Items are routing decisions from
-the ledger, newest last.
+Only undecided sends are served: once an executor has acked a
+messageId (delivered / failed / dry-run) the send is folded out of the
+queue. `seen` is a read receipt and does not fold. Poll with the last
+`seq` as `after` (exact, even for two lines written in the same
+millisecond); the legacy `since=<ts>` cursor still works. `latest` is
+the current top of the ledger — a fresh executor that must not replay
+history starts there.
 
-## Inject a hub-originated send (gate first, always)
+## Approval inbox: `GET /pending`, `POST /confirm`, `POST /reject`
 
-Step 1 — approval gate:
+Every held send, whatever its origin (hub draft, relay copy, cowork
+copy), is listed with the untranslated source, the patterns that held it
+and the exact text that would go out:
+
+```sh
+curl "$CORE/pending"
+curl -X POST "$CORE/confirm" -H 'content-type: application/json' -d '{"id":"…"}'
+curl -X POST "$CORE/reject"  -H 'content-type: application/json' -d '{"id":"…"}'
+```
+
+Confirmation is by id only. A `body` in the request is a 400: approval
+binds to the reviewed text, it never substitutes one. Held sends
+survive a core restart (rebuilt from the ledger).
+
+## Inject a hub-originated send
+
+Two entrances, one gate. Both translate per bound channel, inspect the
+source and every translation, and either write sendable `out` lines or
+hold them for `/confirm`.
+
+`/send` — a hub draft, held as a whole. On hold the response carries the
+per-channel translation and its back-translation for review; confirming
+the id releases exactly those strings:
 
 ```sh
 curl -X POST "$CORE/send" -H 'content-type: application/json' \
   -d '{"body":"내일 3시에 만나요","lang":"ko"}'
-# held:true → {id, matched, roundTrips[]} → inspect, then:
-curl -X POST "$CORE/confirm" -H 'content-type: application/json' \
-  -d '{"id":"hub:…"}'
-# held:false → proceed directly
+# held:true  → {id, matched, roundTrips[{channel, translated, backTranslation}]}
+# held:false → {id, policies[]} — the out lines are already written
+curl -X POST "$CORE/confirm" -H 'content-type: application/json' -d '{"id":"hub:…"}'
 ```
 
-Step 2 — fan-out into the pipeline (cowork path):
+`/cowork/ingress` — a message from a cowork client, tagged origin=cowork;
+copies that trip the gate are held one by one and appear in `/pending`:
 
 ```sh
 curl -X POST "$CORE/cowork/ingress" -H 'content-type: application/json' \
   -d '{"nativeId":"cowork-001","lang":"ko","body":"…"}'
 ```
 
-Skipping step 1 bypasses the gate and violates the policy below.
+There is no path that writes a sendable line without inspection.
 `nativeId` is your idempotency key: reuse your `client_message_id` here.
-A retried id executes nothing — only the duplicate receipt is logged
-(`verdict: duplicate`). Timeouts are safe to retry with the same id.
-
-Path note: the hub screen's `/send` leaves gate lines only — it never
-creates `out` entries. Anything that must actually send goes through
-`/cowork/ingress` (or an `origin=hub` ingress).
+The original is persisted before translation; a retried id that already
+ran executes nothing (`duplicate: true`), one that is mid-flight gets
+202 `processing`, and one whose translation failed (503,
+`retryable: true`) resumes at translation on the next request. Timeouts
+are safe to retry with the same id.
 
 ## Acknowledge: consumed is not delivered
 

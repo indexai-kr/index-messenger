@@ -7,12 +7,17 @@
    - `toIngress(nativeEvent)` — map to `{ origin, nativeId, lang, body }`
      or return `null` for non-message events.
 2. POST ingress events to core `POST /ingress`.
-3. Poll core `GET /outbox?channel=<name>&since=<ts>` for outbound work —
-   it serves sendable lines only (hub/cowork sends and whitelisted relay
-   copies; record-only copies never appear). Report every outcome to
+3. Poll core `GET /outbox?channel=<name>&after=<seq>` for outbound work —
+   it serves undecided sendable lines only (hub/cowork sends and
+   whitelisted relay copies; record-only copies never appear; sends you
+   already acked are folded out). Report every outcome to
    `POST /outbox/ack`, with the platform-assigned `nativeId` on success so
    the core can drop your own send when it comes back through ingress.
    Keep a per-id dedupe on your side: never execute a messageId twice.
+   If the ack itself fails after a successful send, keep it and retry
+   the ack — never re-send to find out. Advance your inbound cursor only
+   after the core accepted the post.
+   With `CORE_AUTH_TOKEN` set on the core, send `Authorization: Bearer`.
 4. Never add protocol reversing, packet capture, or unofficial endpoints.
    Closed messengers are notification-listener / accessibility-API only.
 
