@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
 import { Router, type BindingTable } from "./router.ts";
-import { Ledger } from "./ledger.ts";
+import { Ledger, type LedgerEntry } from "./ledger.ts";
 import { inspect } from "./gate.ts";
 import { pLimit } from "./p-limit.ts";
 import {
@@ -140,6 +140,105 @@ const TRUST_FIELDS = [
   "ts",
 ];
 
+// One held send. `source` is the untranslated original and `matched` the
+// patterns that held it — both are review context, not send data.
+export type Pending =
+  | {
+      kind: "relay";
+      to: string;
+      body: string;
+      lang: string;
+      sender?: SenderInfo;
+      source: string;
+      matched: string[];
+    }
+  | {
+      kind: "fanout";
+      body: string;
+      lang: string;
+      copies: Array<{ channel: string; lang: string; body: string }>;
+      source: string;
+      matched: string[];
+    };
+
+interface RoundTrip {
+  channel: string;
+  lang: string;
+  translated: string;
+  backTranslation: string;
+  translateMs: number;
+  backMs: number;
+}
+
+function pendingView(id: string, held: Pending): Record<string, unknown> {
+  return held.kind === "relay"
+    ? { id, kind: "relay", to: held.to, lang: held.lang, body: held.body, source: held.source, matched: held.matched, sender: held.sender }
+    : { id, kind: "fanout", lang: held.lang, source: held.source, matched: held.matched, copies: held.copies };
+}
+
+// Hub-originated ids: millisecond time plus a per-process counter, so two
+// sends in the same millisecond never collide.
+let hubSeq = 0;
+function nextHubNativeId(): string {
+  hubSeq = (hubSeq + 1) % 1000;
+  return `${Date.now()}-${String(hubSeq).padStart(3, "0")}`;
+}
+
+// Rebuild the pending map from the ledger: every gate|hold line whose id
+// has no later confirmed/rejected line is still waiting. Relay holds are
+// keyed by their out id; hub holds (origin=hub) are grouped per draft
+// under the draft id, one copy per channel line. Legacy hub holds that
+// predate the origin tag are not resurrected — they were never
+// confirmable across a restart, and they belong to no live screen.
+export function rebuildPending(history: LedgerEntry[]): Map<string, Pending> {
+  const decided = new Set<string>();
+  for (const e of history) {
+    if (e.direction === "gate" && (e.verdict === "confirmed" || e.verdict === "rejected")) decided.add(e.messageId);
+  }
+  const out = new Map<string, Pending>();
+  const drafts = new Map<string, Pending & { kind: "fanout" }>();
+  for (const e of history) {
+    if (e.direction !== "gate" || e.verdict !== "hold") continue;
+    if (e.origin === "relay") {
+      if (decided.has(e.messageId)) continue;
+      const arrow = e.messageId.lastIndexOf("->");
+      if (arrow < 0) continue;
+      out.set(e.messageId, {
+        kind: "relay",
+        to: e.channel,
+        body: e.body,
+        lang: e.lang,
+        sender: e.sender,
+        source: "",
+        matched: [],
+      });
+      continue;
+    }
+    if (e.origin === HUB) {
+      const arrow = e.messageId.lastIndexOf("->");
+      if (arrow < 0) continue;
+      const draftId = e.messageId.slice(0, arrow);
+      if (decided.has(draftId)) continue;
+      let draft = drafts.get(draftId);
+      if (draft === undefined) {
+        draft = { kind: "fanout", body: "", lang: "", copies: [], source: "", matched: [] };
+        drafts.set(draftId, draft);
+      }
+      draft.copies = draft.copies.filter((c) => c.channel !== e.channel);
+      draft.copies.push({ channel: e.channel, lang: e.lang, body: e.body });
+    }
+  }
+  // The draft's own text is its inbound hub line.
+  for (const [draftId, draft] of drafts) {
+    const inbound = history.find((e) => e.direction === "in" && e.channel === HUB && e.messageId === draftId);
+    draft.body = inbound?.body ?? "";
+    draft.lang = inbound?.lang ?? "";
+    draft.source = draft.body;
+    out.set(draftId, draft);
+  }
+  return out;
+}
+
 // Thin HTTP wiring over the core pipeline. Adapter processes POST native
 // events here; the hub polls/reads state here. No secrets in code.
 export async function startServer(config: ServerConfig): Promise<void> {
@@ -165,13 +264,14 @@ export async function startServer(config: ServerConfig): Promise<void> {
 
   const router = new Router({ bindings, translate });
   const relay = await loadRelay(config.relayPath);
-  // Held sends awaiting /confirm. `to: "fanout"` is a hub draft (the hub
-  // fans out after confirmation); any other `to` is one relay copy that
-  // is released as a sendable out line on confirmation.
-  const pending = new Map<
-    string,
-    { to: string; body: string; lang: string; sender?: SenderInfo; origin?: string }
-  >();
+  // Held sends awaiting /confirm or /reject. A "relay" entry is one
+  // derived copy (origin:native->channel) released as-is; a "fanout"
+  // entry is a hub draft whose per-channel translations were already
+  // produced and shown for review — confirmation releases exactly those
+  // strings, it never translates again. The map is a cache: the ledger
+  // is the record, and the map is rebuilt from it at startup so a
+  // restart loses no approval.
+  const pending = new Map<string, Pending>();
 
   // Fan-out recorder shared by every ingress path. Policy per copy:
   //   send        hub/cowork-originated, or a hub display copy -> sendable
@@ -188,12 +288,16 @@ export async function startServer(config: ServerConfig): Promise<void> {
     msg: { id: string; origin: string; body: string },
     sender: SenderInfo | undefined,
     targets: Array<{ channel: string; lang: string; body: string }>,
+    // `approved`: these copies were held, reviewed and confirmed. They are
+    // written as sendable without a second inspection — the inspection
+    // already happened on exactly these strings.
+    approved = false,
   ): Promise<Array<{ channel: string; policy: OutPolicy | "held"; matched?: string[] }>> {
     const decisions: Array<{ channel: string; policy: OutPolicy | "held"; matched?: string[] }> = [];
     for (const copy of targets) {
       const policy = outPolicy(msg.origin, copy.channel, relay);
       const outId = `${msg.id}->${copy.channel}`;
-      if (policy === "relay") {
+      if (policy === "relay" && !approved) {
         const matched = [...new Set([...inspect(msg.body), ...inspect(copy.body)])];
         if (matched.length > 0) {
           await ledger.append({
@@ -209,7 +313,15 @@ export async function startServer(config: ServerConfig): Promise<void> {
             origin: "relay",
             verdict: "hold",
           });
-          pending.set(outId, { to: copy.channel, body: copy.body, lang: copy.lang, sender, origin: "relay" });
+          pending.set(outId, {
+            kind: "relay",
+            to: copy.channel,
+            body: copy.body,
+            lang: copy.lang,
+            sender,
+            source: msg.body,
+            matched,
+          });
           decisions.push({ channel: copy.channel, policy: "held", matched });
           continue;
         }
@@ -238,7 +350,8 @@ export async function startServer(config: ServerConfig): Promise<void> {
   // restart cannot re-execute history.
   const seenIngress = new Set<string>();
   try {
-    for (const entry of await ledger.readAll()) {
+    const history = await ledger.readAll();
+    for (const entry of history) {
       if (entry.direction === "in" && entry.verdict === undefined) {
         seenIngress.add(entry.messageId);
       }
@@ -249,6 +362,8 @@ export async function startServer(config: ServerConfig): Promise<void> {
         router.markEmitted(`${entry.channel}:${entry.nativeId}`);
       }
     }
+    for (const [id, held] of rebuildPending(history)) pending.set(id, held);
+    if (pending.size > 0) console.log(`index-messenger core: ${pending.size} held send(s) restored from the ledger`);
   } catch {
     // Fresh ledger: nothing to rebuild.
   }
@@ -404,107 +519,101 @@ export async function startServer(config: ServerConfig): Promise<void> {
         send(res, 200, { ...routed, stripped, policies });
         return;
       }
-      // Hub outbound with gate: { body, lang }
-      // Pass-through when no risk pattern matches. On hold, translate
-      // per target channel (source -> channel lang -> hub lang) so the hub
-      // screen shows a real round-trip back-translation per recipient.
+      // Hub outbound: { body, lang }. One path for every hub sentence:
+      // record the draft as an inbound hub line, translate per bound
+      // channel, then either write the sendable out lines right away
+      // (no risk pattern) or hold every copy — with its back-translation
+      // for review — until /confirm releases exactly those strings.
       if (req.method === "POST" && req.url === "/send") {
-        const event = (await readJson(req)) as { body: string; lang: string };
-        const hubLang = router.hubLang();
-        const matched = inspect(event.body);
-        const id = `hub:${Date.now()}`;
-        if (matched.length === 0) {
-          await ledger.append({
-            ts: Date.now(),
-            direction: "gate",
-            channel: "hub",
-            messageId: id,
-            lang: event.lang,
-            body: event.body,
-            verdict: "pass",
-          });
-          send(res, 200, { held: false, id, matched, roundTrips: [] });
+        const event = ((await readJson(req)) ?? {}) as Record<string, unknown>;
+        if (typeof event.body !== "string" || event.body.trim() === "" || typeof event.lang !== "string") {
+          send(res, 400, { error: "body and lang are required" });
           return;
         }
-        // Hybrid parallel legs: channels run concurrently under a cap,
-        // translate->back per channel stays serial. Abort fires on ERRORS
-        // only (transport/provider failure) — hold is a normal verdict
-        // decided upfront by inspect(), never a failure, so it can never
-        // cancel sibling channels. One channel's error aborts the rest
-        // (fail-fast) and the request 500s via the outer catch.
+        const hubLang = router.hubLang();
+        const msg = makeMessage(HUB, nextHubNativeId(), event.lang, event.body, Date.now());
+        const id = msg.id;
+        const matched = inspect(event.body);
+        // Translation legs run concurrently under a cap; one leg's error
+        // aborts the rest (fail-fast) and the request 500s via the outer
+        // catch. Nothing has been written yet at that point, so a retry
+        // starts clean.
         const gateConcurrency = Math.max(1, Number(env("GATE_CONCURRENCY", "4")) || 4);
         const limit = pLimit(gateConcurrency);
         const abort = new AbortController();
-        const leg = async (
-          channel: string,
-          lang: string,
-        ): Promise<{
-          channel: string;
-          lang: string;
-          translated: string;
-          backTranslation: string;
-          translateMs: number;
-          backMs: number;
-        }> => {
+        const leg = async (channel: string, lang: string): Promise<RoundTrip> => {
           if (lang === event.lang) {
-            await ledger.append({
-              ts: Date.now(),
-              direction: "gate",
-              channel,
-              messageId: `${id}->${channel}`,
-              lang,
-              body: event.body,
-              translatedLang: hubLang,
-              translatedBody: event.body,
-              verdict: "hold",
-            });
-            return {
-              channel,
-              lang,
-              translated: event.body,
-              backTranslation: event.body,
-              translateMs: 0,
-              backMs: 0,
-            };
+            return { channel, lang, translated: msg.body, backTranslation: msg.body, translateMs: 0, backMs: 0 };
           }
           const t0 = Date.now();
-          const translated = await translate.translate(event.body, event.lang, lang, abort.signal);
+          const translated = await translate.translate(msg.body, msg.lang, lang, abort.signal);
           const t1 = Date.now();
-          const backTranslation = await translate.translate(translated, lang, hubLang, abort.signal);
+          // Back-translation is review evidence: only produced for a hold.
+          const backTranslation =
+            matched.length > 0 ? await translate.translate(translated, lang, hubLang, abort.signal) : "";
           const t2 = Date.now();
-          await ledger.append({
-            ts: Date.now(),
-            direction: "gate",
-            channel,
-            messageId: `${id}->${channel}`,
-            lang,
-            body: translated,
-            translatedLang: hubLang,
-            translatedBody: backTranslation,
-            verdict: "hold",
-          });
-          return {
-            channel,
-            lang,
-            translated,
-            backTranslation,
-            translateMs: t1 - t0,
-            backMs: t2 - t1,
-          };
+          return { channel, lang, translated, backTranslation, translateMs: t1 - t0, backMs: t2 - t1 };
         };
-        let roundTrips: Awaited<ReturnType<typeof leg>>[];
+        let roundTrips: RoundTrip[];
         try {
           roundTrips = await Promise.all(
             Object.entries(router.getBindings())
-              .filter(([channel]) => channel !== "hub")
+              .filter(([channel]) => channel !== HUB)
               .map(([channel, lang]) => limit(() => leg(channel, lang))),
           );
         } catch (error) {
           abort.abort();
           throw error;
         }
-        pending.set(id, { to: "fanout", body: event.body, lang: event.lang });
+        const copies = roundTrips.map((r) => ({ channel: r.channel, lang: r.lang, body: r.translated }));
+        await ledger.append({
+          ts: msg.ts,
+          direction: "in",
+          channel: HUB,
+          messageId: id,
+          lang: msg.lang,
+          body: msg.body,
+        });
+        seenIngress.add(id);
+        if (matched.length === 0) {
+          await ledger.append({
+            ts: Date.now(),
+            direction: "gate",
+            channel: HUB,
+            messageId: id,
+            lang: msg.lang,
+            body: msg.body,
+            origin: HUB,
+            verdict: "pass",
+          });
+          const policies = await recordFanout(msg, undefined, copies);
+          send(res, 200, { held: false, id, matched, roundTrips: [], policies });
+          return;
+        }
+        // Hold: one gate line per channel carrying the exact string that
+        // would go out and what it reads back as. These lines are what a
+        // restart rebuilds the pending entry from.
+        for (const r of roundTrips) {
+          await ledger.append({
+            ts: Date.now(),
+            direction: "gate",
+            channel: r.channel,
+            messageId: `${id}->${r.channel}`,
+            lang: r.lang,
+            body: r.translated,
+            translatedLang: hubLang,
+            translatedBody: r.backTranslation,
+            origin: HUB,
+            verdict: "hold",
+          });
+        }
+        pending.set(id, { kind: "fanout", body: msg.body, lang: msg.lang, copies, source: msg.body, matched });
         send(res, 200, { held: true, id, matched, roundTrips });
+        return;
+      }
+      // Approval inbox: every held send, hub drafts and relay copies alike.
+      if (req.method === "GET" && req.url === "/pending") {
+        send(res, 200, { items: [...pending.entries()].map(([id, held]) => pendingView(id, held)) });
         return;
       }
       // Confirmation binds to the exact text that was reviewed. The request
@@ -526,37 +635,72 @@ export async function startServer(config: ServerConfig): Promise<void> {
           send(res, 404, { error: "unknown pending id" });
           return;
         }
-        pending.delete(event.id);
-        const body = held.body;
-        const isRelay = held.to !== "fanout";
+        // Record first, forget last: if a write fails the entry stays
+        // pending and the confirm can be retried.
         await ledger.append({
           ts: Date.now(),
           direction: "gate",
-          channel: isRelay ? held.to : "hub",
+          channel: held.kind === "relay" ? held.to : HUB,
           messageId: event.id,
           lang: held.lang,
-          body,
-          origin: held.origin,
+          body: held.body,
+          origin: held.kind === "relay" ? "relay" : HUB,
           verdict: "confirmed",
         });
-        // A confirmed relay copy becomes the sendable out line it would
-        // have been without the hold — same shape, same /outbox path.
-        if (isRelay) {
+        let released: string[];
+        if (held.kind === "relay") {
+          // A confirmed relay copy becomes the sendable out line it would
+          // have been without the hold — same shape, same /outbox path.
           await ledger.append({
             ts: Date.now(),
             direction: "out",
             channel: held.to,
             messageId: event.id,
             lang: held.lang,
-            body,
+            body: held.body,
             translatedLang: held.lang,
-            translatedBody: body,
+            translatedBody: held.body,
             sender: held.sender,
-            origin: held.origin,
+            origin: "relay",
           });
           router.markEmitted(event.id);
+          released = [held.to];
+        } else {
+          // The reviewed translations go out verbatim. No re-translation:
+          // what was approved is what is sent.
+          const msg = { id: event.id, origin: HUB, body: held.body };
+          const policies = await recordFanout(msg, undefined, held.copies, true);
+          released = policies.map((p) => p.channel);
         }
-        send(res, 200, { confirmed: true, released: isRelay ? held.to : undefined });
+        pending.delete(event.id);
+        send(res, 200, { confirmed: true, released: held.kind === "relay" ? held.to : undefined, channels: released });
+        return;
+      }
+      // Rejection: the held text is dropped, nothing goes out, the verdict
+      // is on record. Same id-only contract as /confirm.
+      if (req.method === "POST" && req.url === "/reject") {
+        const event = ((await readJson(req)) ?? {}) as Record<string, unknown>;
+        if (typeof event.id !== "string") {
+          send(res, 400, { error: "id is required" });
+          return;
+        }
+        const held = pending.get(event.id);
+        if (!held) {
+          send(res, 404, { error: "unknown pending id" });
+          return;
+        }
+        await ledger.append({
+          ts: Date.now(),
+          direction: "gate",
+          channel: held.kind === "relay" ? held.to : HUB,
+          messageId: event.id,
+          lang: held.lang,
+          body: "",
+          origin: held.kind === "relay" ? "relay" : HUB,
+          verdict: "rejected",
+        });
+        pending.delete(event.id);
+        send(res, 200, { rejected: true });
         return;
       }
       // Outbox queue for poll-based executors (kakao-listener, discord runner).

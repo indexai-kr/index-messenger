@@ -5,7 +5,7 @@
   "type": "module",
   "main": "./index.ts",
   "scripts": {
-    "test": "node --test ./router.test.ts ./gate.test.ts ./ledger.test.ts ./ack.test.ts ./limit.test.ts ./ingress.test.ts ./relay.test.ts ./auth.test.ts",
+    "test": "node --test ./router.test.ts ./gate.test.ts ./ledger.test.ts ./ack.test.ts ./limit.test.ts ./ingress.test.ts ./relay.test.ts ./auth.test.ts ./send.test.ts",
     "typecheck": "npx -y tsc --noEmit"
   },
   "license": "Apache-2.0",

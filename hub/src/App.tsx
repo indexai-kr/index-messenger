@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, type LedgerEntry, type RoundTrip } from "./api.ts";
+import { api, type LedgerEntry, type PendingItem, type RoundTrip } from "./api.ts";
 
 // Single conversation screen (Korean hub) + channel binding settings.
 // Polls /ledger for the converged Korean view; posts via /send so the
@@ -9,15 +9,17 @@ export function App(): JSX.Element {
   const [bindings, setBindings] = useState<Record<string, string>>({});
   const [draft, setDraft] = useState("");
   const [held, setHeld] = useState<{ id: string; matched: string[]; roundTrips: RoundTrip[] } | null>(null);
+  const [pending, setPending] = useState<PendingItem[]>([]);
   const [error, setError] = useState("");
   const [showRaw, setShowRaw] = useState(false);
   const [loading, setLoading] = useState(true);
 
   async function refresh(): Promise<void> {
     try {
-      const [ledger, bindingTable] = await Promise.all([api.ledger(), api.bindings()]);
+      const [ledger, bindingTable, inbox] = await Promise.all([api.ledger(), api.bindings(), api.pending()]);
       setEntries(ledger.slice(-100));
       setBindings(bindingTable);
+      setPending(inbox.items);
       setError("");
     } catch (e) {
       setError((e as Error).message);
@@ -68,6 +70,20 @@ function formatLine(e: LedgerEntry): string {
     await refresh();
   }
 
+  async function decide(id: string, ok: boolean): Promise<void> {
+    try {
+      if (ok) await api.confirm(id);
+      else await api.reject(id);
+      if (held?.id === id) {
+        setHeld(null);
+        setDraft("");
+      }
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
   return (
     <main style={{ maxWidth: 720, margin: "0 auto", padding: 16 }}>
       <h1>Index Messenger Hub</h1>
@@ -103,6 +119,33 @@ function formatLine(e: LedgerEntry): string {
             <button onClick={() => void onConfirm()}>확인 후 전송</button>
           </div>
         )}
+      </section>
+      <section>
+        <h2>승인 대기 ({pending.length})</h2>
+        {pending.length === 0 && <p>보류된 발신이 없습니다.</p>}
+        <ul>
+          {pending.map((p) => (
+            <li key={p.id}>
+              <div>
+                [{p.kind === "relay" ? `relay → ${p.to}` : "hub 발신"}] 감지: {p.matched.join(", ") || "-"}
+                {p.sender !== undefined ? ` · ${p.sender.displayName}` : ""}
+              </div>
+              <div>원문: {p.source}</div>
+              {p.kind === "relay" && <div>발신 예정({p.lang}): {p.body}</div>}
+              {p.kind === "fanout" && (
+                <ul>
+                  {(p.copies ?? []).map((c) => (
+                    <li key={c.channel}>
+                      [{c.channel}/{c.lang}] {c.body}
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <button onClick={() => void decide(p.id, true)}>승인 후 전송</button>
+              <button onClick={() => void decide(p.id, false)}>거절</button>
+            </li>
+          ))}
+        </ul>
       </section>
       <section>
         <h2>채널 결박 (channel → lang)</h2>

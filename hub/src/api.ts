@@ -47,7 +47,25 @@ export interface SendResult {
   roundTrips: RoundTrip[];
 }
 
+export interface PendingItem {
+  id: string;
+  kind: "relay" | "fanout";
+  to?: string;
+  lang: string;
+  body?: string;
+  source: string;
+  matched: string[];
+  copies?: Array<{ channel: string; lang: string; body: string }>;
+  sender?: { platform: string; id: string; displayName: string };
+}
+
 export const api = {
+  pending: () => call<{ items: PendingItem[] }>("/pending"),
+  reject: (id: string) =>
+    call<{ rejected: boolean }>("/reject", {
+      method: "POST",
+      body: JSON.stringify({ id }),
+    }),
   health: () => call<{ ok: boolean }>("/health"),
   bindings: () => call<Record<string, string>>("/bindings"),
   saveBindings: (b: Record<string, string>) =>
